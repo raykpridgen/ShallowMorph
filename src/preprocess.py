@@ -17,6 +17,12 @@ Outputs (written to ``MORPH/datasets/``):
      and the ``dataset_specs`` to pass to the training script.
 
 No normalization is applied; RevIN stats are computed at training time.
+
+Packing uses **one pass** over trajectories (each file read once). Train/val/test
+arrays are filled directly, so RAM does not spike with a temporary “list + stack”
+of the full dataset. The optional ``*_all.npy`` is written via ``numpy`` memmap
+row-by-row so peak resident memory stays close to one full dataset worth of
+floats (the three split buffers), not two copies plus splits.
 """
 
 from __future__ import annotations
@@ -30,21 +36,17 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from utils import (
-    DATASETS_DIR,
     DEFAULT_SPLIT_RATIOS,
     DEFAULT_SPLIT_SEED,
-    OUT_DIR,
     PROCESSED_DIR,
     SW2D_DIR,
     SW_DATASET_NAME,
     SW_DATASET_SPECS,
-    SW_EXPECTED_SHAPE_PER_TRAJ,
-    apply_split,
     discover_trajectory_files,
     get_logger,
     group_split_indices,
-    load_trajectories,
-    load_trajectories_from_h5,
+    pack_splits_streaming_from_files,
+    pack_splits_streaming_from_h5,
     save_manifest,
 )
 
@@ -116,35 +118,59 @@ def preprocess(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Load ────────────────────────────────────────────────────────────
-    if args.h5 is not None:
-        log.info("Loading from HDF5: %s", args.h5)
-        dataset = load_trajectories_from_h5(args.h5, logger=log)
-    else:
-        log.info("Loading from folder: %s", args.sw2d_dir)
-        files = discover_trajectory_files(args.sw2d_dir)
-        dataset = load_trajectories(files, logger=log)
-
-    N, T, H, W, C = dataset.shape
-    log.info("Dataset: N=%d, T=%d, H=%d, W=%d, C=%d", N, T, H, W, C)
-
-    # ── Validate ────────────────────────────────────────────────────────
-    assert dataset.dtype == np.float32, f"Expected float32, got {dataset.dtype}"
-    assert np.isfinite(dataset).all(), "Dataset contains non-finite values"
-    log.info("Validation passed (float32, all finite)")
-
-    # ── Group-wise split ────────────────────────────────────────────────
+    # ── Discover size + split indices (no full (N,...) tensor yet) ───────
     ratios = (args.train_ratio, args.val_ratio, args.test_ratio)
     total = sum(ratios)
     if abs(total - 1.0) > 1e-6:
         log.error("Split ratios sum to %.4f, must equal 1.0", total)
         sys.exit(1)
 
-    indices = group_split_indices(N, ratios=ratios, seed=args.seed)
-    splits = apply_split(dataset, indices)
+    if args.h5 is not None:
+        log.info("Packing from HDF5 (streaming): %s", args.h5)
+        import h5py
+
+        with h5py.File(args.h5, "r") as _f:
+            n_traj = len(_f.keys())
+        if n_traj == 0:
+            log.error("HDF5 file has no groups.")
+            sys.exit(1)
+    else:
+        log.info("Packing from folder (streaming): %s", args.sw2d_dir)
+        files = discover_trajectory_files(args.sw2d_dir)
+        n_traj = len(files)
+
+    log.info("Trajectories: N=%d", n_traj)
+    indices = group_split_indices(n_traj, ratios=ratios, seed=args.seed)
+
+    all_npy_path: Path | None = None
+    if not args.skip_all:
+        all_npy_path = out_dir / f"{args.name}_all.npy"
+
+    if args.h5 is not None:
+        splits = pack_splits_streaming_from_h5(
+            args.h5,
+            indices,
+            all_npy_path=all_npy_path,
+            logger=log,
+        )
+    else:
+        splits = pack_splits_streaming_from_files(
+            files,
+            indices,
+            all_npy_path=all_npy_path,
+            logger=log,
+        )
+
+    probe = splits["train"]
+    T, H, W, C = probe.shape[1], probe.shape[2], probe.shape[3], probe.shape[4]
+    N = n_traj
+    log.info("Dataset: N=%d, T=%d, H=%d, W=%d, C=%d", N, T, H, W, C)
+    log.info("Validation passed (per-trajectory checks in packer; float32)")
 
     for name, arr in splits.items():
         log.info("  %-6s %d trajectories  shape %s", name, arr.shape[0], arr.shape)
+
+    split_sizes = {k: int(v.shape[0]) for k, v in splits.items()}
 
     # ── Save splits ─────────────────────────────────────────────────────
     files_written: dict[str, str] = {}
@@ -156,12 +182,11 @@ def preprocess(args: argparse.Namespace) -> None:
         files_written[split_name] = fname
         log.info("Saved %s  (%s)", fpath, arr.shape)
 
-    if not args.skip_all:
-        all_fname = f"{args.name}_all.npy"
-        all_path = out_dir / all_fname
-        np.save(all_path, dataset)
-        files_written["all"] = all_fname
-        log.info("Saved %s  (%s)", all_path, dataset.shape)
+    if all_npy_path is not None:
+        files_written["all"] = f"{args.name}_all.npy"
+        log.info("Saved %s  (written via memmap during pack)", all_npy_path)
+
+    del splits
 
     # ── Manifest ────────────────────────────────────────────────────────
     manifest_path = out_dir / f"{args.name}_manifest.json"
@@ -173,7 +198,7 @@ def preprocess(args: argparse.Namespace) -> None:
         w=W,
         split_seed=args.seed,
         split_ratios=ratios,
-        split_sizes={k: int(v.shape[0]) for k, v in splits.items()},
+        split_sizes=split_sizes,
         dataset_specs=SW_DATASET_SPECS,
         files=files_written,
     )
@@ -186,7 +211,7 @@ def preprocess(args: argparse.Namespace) -> None:
              SW_DATASET_SPECS["F"], SW_DATASET_SPECS["C"],
              SW_DATASET_SPECS["D"], SW_DATASET_SPECS["H"], SW_DATASET_SPECS["W"])
     log.info("  Splits: train=%d  val=%d  test=%d",
-             splits["train"].shape[0], splits["val"].shape[0], splits["test"].shape[0])
+             split_sizes["train"], split_sizes["val"], split_sizes["test"])
     log.info("  Output dir: %s", out_dir)
 
 
