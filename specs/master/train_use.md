@@ -79,3 +79,12 @@ python src/train_step.py \
     --patience 10 \
     --parallel dp \
     --device-idx 0
+
+
+python src/evaluate.py \
+    --checkpoint
+  MORPH/models/shallow_water/ft_morph-Ti-shallow_water-ar1_max_ar1_lora16_ftlev5_lr0.0001_wd0.0_best.pth \
+    --model-size Ti \
+    --rollout-horizon 20 \
+    --batch-size 16 \
+    --device-idx 0
