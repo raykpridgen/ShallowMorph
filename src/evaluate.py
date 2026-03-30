@@ -388,40 +388,45 @@ def main() -> None:
         np.save(out_dir / f"rollout_pred_{tag}.npy", rollout_pred_vis)
         log.info("  Saved rollout .npy arrays")
 
-        # GIF — actual
-        render_sequence_gif(
-            rollout_actual_vis, out_dir / f"gif_actual_{tag}.gif",
-            title_prefix=f"Actual (traj {vis_idx})", fps=args.rollout_horizon // 2 or 5,
-        )
-        # GIF — predicted rollout
-        render_sequence_gif(
-            rollout_pred_vis, out_dir / f"gif_rollout_{tag}.gif",
-            title_prefix=f"Rollout (traj {vis_idx})", fps=args.rollout_horizon // 2 or 5,
-        )
-        log.info("  Saved GIFs")
+        try:
+            render_sequence_gif(
+                rollout_actual_vis, out_dir / f"gif_actual_{tag}.gif",
+                title_prefix=f"Actual (traj {vis_idx})", fps=args.rollout_horizon // 2 or 5,
+            )
+            render_sequence_gif(
+                rollout_pred_vis, out_dir / f"gif_rollout_{tag}.gif",
+                title_prefix=f"Rollout (traj {vis_idx})", fps=args.rollout_horizon // 2 or 5,
+            )
+            log.info("  Saved GIFs")
+        except Exception:
+            log.warning("  Failed to generate GIFs", exc_info=True)
 
-        # Diff triptych at several timesteps
-        diff_steps = [0, horizon // 4, horizon // 2, horizon - 1]
-        for t_step in diff_steps:
-            if t_step < rollout_actual_vis.shape[0]:
-                plot_diff_frame(
-                    rollout_actual_vis[t_step],
-                    rollout_pred_vis[t_step],
-                    t_idx=t_step + 1,
-                    label=f"Traj {vis_idx}",
-                    save_path=out_dir / f"diff_t{t_step + 1:03d}_{tag}.png",
-                )
-        log.info("  Saved diff triptychs")
+        try:
+            diff_steps = [0, horizon // 4, horizon // 2, horizon - 1]
+            for t_step in diff_steps:
+                if t_step < rollout_actual_vis.shape[0]:
+                    plot_diff_frame(
+                        rollout_actual_vis[t_step],
+                        rollout_pred_vis[t_step],
+                        t_idx=t_step + 1,
+                        label=f"Traj {vis_idx}",
+                        save_path=out_dir / f"diff_t{t_step + 1:03d}_{tag}.png",
+                    )
+            log.info("  Saved diff triptychs")
+        except Exception:
+            log.warning("  Failed to generate diff triptychs", exc_info=True)
 
-        # Sequence grid
-        plot_sequence_grid(
-            rollout_actual_vis,
-            rollout_pred_vis,
-            n_cols=min(8, horizon),
-            label=f"Traj {vis_idx} rollout",
-            save_path=out_dir / f"grid_{tag}.png",
-        )
-        log.info("  Saved sequence grid")
+        try:
+            plot_sequence_grid(
+                rollout_actual_vis,
+                rollout_pred_vis,
+                n_cols=min(8, horizon),
+                label=f"Traj {vis_idx} rollout",
+                save_path=out_dir / f"grid_{tag}.png",
+            )
+            log.info("  Saved sequence grid")
+        except Exception:
+            log.warning("  Failed to generate sequence grid", exc_info=True)
 
     # ── Per-horizon RMSE plot ───────────────────────────────────────────
     import matplotlib.pyplot as plt
