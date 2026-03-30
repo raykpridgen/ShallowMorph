@@ -1,0 +1,7 @@
+numpy>=2.0
+torch>=2.0
+matplotlib>=3.7
+tqdm>=4.60
+Pillow>=10.0
+h5py>=3.9
+huggingface-hub>=0.20
