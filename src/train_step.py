@@ -106,8 +106,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Level-3: + Decoder linear")
     p.add_argument("--ft-level4", action="store_true",
                    help="Level-4: unfreeze everything")
-    p.add_argument("--ft-decoder-only", action="store_true",
-                   help="Freeze everything except the decoder linear layer")
     p.add_argument("--lr-level4", type=float, default=1e-4)
     p.add_argument("--wd-level4", type=float, default=0.0)
 
@@ -179,34 +177,16 @@ def _to_uptf7(arr: np.ndarray, specs: list[int]) -> np.ndarray:
 
 
 def _finetune_level(args: argparse.Namespace) -> int:
-    if args.ft_decoder_only:
-        return 5
     if args.ft_level4:
         return 4
-    if args.ft_level1 and args.ft_level2 and args.ft_level3:
+    if args.ft_level3:
         return 3
-    if args.ft_level1 and args.ft_level2:
+    if args.ft_level2:
         return 2
     if args.ft_level1:
         return 1
-    raise ValueError("Select a fine-tuning level: --ft-level1/2/3, --ft-level4, or --ft-decoder-only")
+    raise ValueError("Select a fine-tuning level: --ft-level1, --ft-level2, --ft-level3, or --ft-level4")
 
-
-def _make_args_compat(args: argparse.Namespace) -> argparse.Namespace:
-    """Map our hyphen-style CLI names to the underscore attrs that MORPH's
-    ``SelectFineTuningParameters`` expects."""
-    compat = argparse.Namespace(**vars(args))
-    compat.ft_level1 = args.ft_level1
-    compat.ft_level2 = args.ft_level2
-    compat.ft_level3 = args.ft_level3
-    compat.ft_level4 = args.ft_level4
-    compat.ft_decoder_only = args.ft_decoder_only
-    compat.lr_level4 = args.lr_level4
-    compat.wd_level4 = args.wd_level4
-    compat.rank_lora_attn = args.rank_lora_attn
-    compat.rank_lora_mlp = args.rank_lora_mlp
-    compat.lora_p = args.lora_p
-    return compat
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -221,13 +201,10 @@ def main() -> None:
     dataset_name = args.dataset_name
     specs = args.dataset_specs
     lev = _finetune_level(args)
-    compat_args = _make_args_compat(args)
-
-    # If level-4, zero out LoRA since the full model is unfrozen
     if lev == 4:
-        compat_args.rank_lora_attn = 0
-        compat_args.rank_lora_mlp = 0
-        compat_args.lora_p = 0
+        args.rank_lora_attn = 0
+        args.rank_lora_mlp = 0
+        args.lora_p = 0
 
     # ── device ──────────────────────────────────────────────────────────
     devices = DeviceManager.list_devices()
@@ -319,8 +296,8 @@ def main() -> None:
     filters, dim, heads, depth, mlp_dim = MORPH_MODELS[args.model_size]
     dropout, emb_dropout = args.tf_reg
 
-    lora_r_attn = compat_args.rank_lora_attn
-    lora_r_mlp  = compat_args.rank_lora_mlp
+    lora_r_attn = args.rank_lora_attn
+    lora_r_mlp  = args.rank_lora_mlp
 
     ft_model = ViT3DRegression(
         patch_size=8, dim=dim, depth=depth,
@@ -330,7 +307,7 @@ def main() -> None:
         max_patches=4096, max_fields=3,
         dropout=dropout, emb_dropout=emb_dropout,
         lora_r_attn=lora_r_attn, lora_r_mlp=lora_r_mlp,
-        lora_alpha=None, lora_p=compat_args.lora_p,
+        lora_alpha=None, lora_p=args.lora_p,
     ).to(device)
 
     n_params = sum(p.numel() for p in ft_model.parameters()) / 1e6
@@ -341,7 +318,7 @@ def main() -> None:
         log.info("Wrapped model in DataParallel (%d GPUs)", n_gpus)
 
     # ── Optimiser (via MORPH's SelectFineTuningParameters) ──────────────
-    selector = SelectFineTuningParameters(ft_model, compat_args)
+    selector = SelectFineTuningParameters(ft_model, args)
     optimizer = selector.configure_levels()
     log.info("Level-%d fine-tuning | LR=%.2e  WD=%.2e",
              lev, optimizer.param_groups[0]["lr"],
@@ -409,7 +386,7 @@ def main() -> None:
         f"ft_morph-{args.model_size}-{dataset_name}"
         f"-ar{args.ar_order}_max_ar{args.max_ar_order}"
         f"_lora{lora_r_attn}_ftlev{lev}"
-        f"_lr{compat_args.lr_level4}_wd{compat_args.wd_level4}"
+        f"_lr{args.lr_level4}_wd{args.wd_level4}"
     )
 
     # ═══════════════════════════════════════════════════════════════════
