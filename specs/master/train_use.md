@@ -66,3 +66,16 @@ python src/train_step.py \
 > --batch-size 24 \
 > --lr 0.001 \
 > --patience 6 \
+
+
+
+python src/train_step.py \
+    --download-model \
+    --model-size Ti \
+    --ft-decoder-only \
+    --n-epochs 150 \
+    --batch-size 8 \
+    --lr-scheduler \
+    --patience 10 \
+    --parallel dp \
+    --device-idx 0

@@ -106,6 +106,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Level-3: + Decoder linear")
     p.add_argument("--ft-level4", action="store_true",
                    help="Level-4: unfreeze everything")
+    p.add_argument("--ft-decoder-only", action="store_true",
+                   help="Freeze everything except the decoder linear layer")
     p.add_argument("--lr-level4", type=float, default=1e-4)
     p.add_argument("--wd-level4", type=float, default=0.0)
 
@@ -177,6 +179,8 @@ def _to_uptf7(arr: np.ndarray, specs: list[int]) -> np.ndarray:
 
 
 def _finetune_level(args: argparse.Namespace) -> int:
+    if args.ft_decoder_only:
+        return 5
     if args.ft_level4:
         return 4
     if args.ft_level1 and args.ft_level2 and args.ft_level3:
@@ -185,7 +189,7 @@ def _finetune_level(args: argparse.Namespace) -> int:
         return 2
     if args.ft_level1:
         return 1
-    raise ValueError("Select a fine-tuning level: --ft-level1/2/3 or --ft-level4")
+    raise ValueError("Select a fine-tuning level: --ft-level1/2/3, --ft-level4, or --ft-decoder-only")
 
 
 def _make_args_compat(args: argparse.Namespace) -> argparse.Namespace:
@@ -196,6 +200,7 @@ def _make_args_compat(args: argparse.Namespace) -> argparse.Namespace:
     compat.ft_level2 = args.ft_level2
     compat.ft_level3 = args.ft_level3
     compat.ft_level4 = args.ft_level4
+    compat.ft_decoder_only = args.ft_decoder_only
     compat.lr_level4 = args.lr_level4
     compat.wd_level4 = args.wd_level4
     compat.rank_lora_attn = args.rank_lora_attn
