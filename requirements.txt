@@ -1,7 +1,12 @@
-numpy>=2.0
-torch>=2.0
-matplotlib>=3.7
-tqdm>=4.60
-Pillow>=10.0
-h5py>=3.9
-huggingface-hub>=0.20
+# -----------------------------------------------------------------------------
+# morph_wrap (code/morph_wrap): Python 3.10+ — standard library only.
+# No PyPI packages required for run_sweep / pick_context / hpc_util.
+# -----------------------------------------------------------------------------
+#
+# MORPH finetuning / PyTorch / scientific stack: use upstream Conda env, e.g.
+#   conda env create -f MORPH/environment.yml
+#   conda activate <env>
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#
+# Optional: pin the same torch build in a pip requirements file on your cluster
+# if you do not use Conda (not maintained here — follow your HPC docs).

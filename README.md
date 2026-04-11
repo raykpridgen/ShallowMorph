@@ -1,306 +1,182 @@
-# MORPH Shallow-Water Fine-Tuning Pipeline
+# MORPH surrogate sweeps
 
-Fine-tune [MORPH](https://huggingface.co/mahindrautela/MORPH) (a Vision-Transformer-based foundation model for PDE surrogates) on 2-D shallow-water simulation data. The pipeline is modular: each stage is a standalone script that reads the previous stage's outputs and writes well-defined artifacts for the next.
+This repository wraps [LANL MORPH](https://github.com/lanl/MORPH) (`./MORPH`) to run **reproducible finetuning sweeps** for a surrogate-modeling study on three PDE datasets. Study design, metrics, and design decisions live under `specs/`.
 
-## Goals
+## Study overview
 
-- **Learn next-step dynamics** of water-height evolution on a 128 x 128 grid by fine-tuning MORPH's pretrained weights with LoRA-style adaptation.
-- **Evaluate both single-step accuracy and multi-step rollout stability**, tracking per-horizon error to detect drift.
-- **Produce publication-ready visualisations** — animated GIFs, actual-vs-predicted triptychs, and strided evolution grids.
+**Goal:** Measure how well MORPH finetunes as a **next-step surrogate** when varying **temporal context** (autoregressive history length), **training-set size**, **epochs**, and **model size**, across:
 
-## Project layout
+| This repo | MORPH `ft_dataset` | Source (DARUS) |
+|-----------|-------------------|----------------|
+| Burgers 1D | `BE1D` | [datafile 268187](https://darus.uni-stuttgart.de/api/access/datafile/268187) |
+| Shallow water 2D | `SW` | [datafile 133021](https://darus.uni-stuttgart.de/api/access/datafile/133021) |
+| Compressible 3D (turb.) | `CFD3D-TURB` | [datafile 164694](https://darus.uni-stuttgart.de/api/access/datafile/164694) |
+
+**Sweep A (72 jobs):** context ∈ {1, 5, 10} frames, train fraction {10%, 50%}, epochs {10, 50}, models {tiny, small}.
+
+**Sweep B (144 jobs):** train fraction {10%, 25%, 50%, 100%}, epochs {10, 50, 100, 200}, models {tiny, small, large}, with **per-dataset** best context chosen after Sweep A (see `specs/design.md` §6.3). By default the driver runs **tiny + small** first; add `--include-large` for all **large** jobs when you have budget.
+
+**Training target:** single next-frame prediction with sliding context; inference uses the same context length as training (`specs/issues.md` I3).
+
+Details: `specs/plan.md`, `specs/design.md`, `specs/issues.md`.
+
+## Repository layout
 
 ```
 morph/
-├── README.md                   ← this file
-├── src/
-│   ├── utils.py                ← shared constants, data loading, MORPH import helpers
-│   ├── preprocess.py           ← Step 1: pack & split raw data
-│   ├── train_step.py           ← Step 2: single-step fine-tuning
-│   ├── evaluate.py             ← Step 3: inference, metrics, visualisation
-│   └── visualize.py            ← plotting library + standalone CLI
-├── specs/                      ← design documents
-│   ├── master/plan.md
-│   ├── preprocess.md
-│   ├── train.md / train_step.md / train_seq.md
-│   ├── evaluation.md
-│   └── visualize.md
-├── MORPH/                      ← MORPH repository (submodule / clone)
-│   ├── models/FM/              ← foundation-model checkpoints
-│   ├── datasets/SW2d/          ← per-trajectory .npy files (1000 trajectories)
-│   ├── datasets/               ← packed splits land here after preprocessing
-│   ├── data/                   ← RevIN normalisation stats
-│   ├── experiments/results/    ← training metrics & loss curves
-│   └── src/utils/              ← MORPH internals (model, trainers, normalization …)
-└── out/                        ← visualisation outputs
-    └── eval/<dataset_name>/    ← evaluate.py outputs
+├── MORPH/                 # upstream MORPH (env, scripts, datasets tree)
+├── code/morph_wrap/       # sweep driver + config
+├── scripts/hpc/           # Slurm example + optional module loader
+├── specs/                 # plan, design, decisions
+├── requirements.txt       # notes: stdlib-only wrap; Conda for MORPH
+└── out/                   # manifests, metrics (gitignored as needed)
 ```
 
-## Quick start
-
-```bash
-# 0. Activate the conda environment with PyTorch
-conda activate ml_base
-
-# 1. Preprocess — pack 1000 trajectories, split 80/10/10
-python src/preprocess.py
-
-# 2. Train — download FM weights, fine-tune with LoRA (level 1)
-python src/train_step.py --download-model --ft-level1
-
-# 3. Evaluate — load best checkpoint, compute metrics, generate plots
-python src/evaluate.py \
-  --checkpoint <name_of_best.pth> \
-  --ft-level1 --rollout-horizon 50
-```
+Local patches under `MORPH/scripts/` include **`SW` in finetune** and a correct training-sample assert when `--ar_order` > 1.
 
 ## Prerequisites
 
-- Python 3.10+
-- PyTorch 2.x with CUDA (the `ml_base` conda environment)
-- numpy, matplotlib, tqdm, Pillow, scikit-learn, huggingface_hub
-- h5py (only needed if loading from raw HDF5)
+1. **MORPH environment** — follow `MORPH/README.md` and `MORPH/docs` (e.g. `conda env create -f MORPH/environment.yml`, PyTorch with CUDA as needed).
+2. **Foundation checkpoints** — place FM weights under `MORPH/models/FM/` with basenames matching `code/morph_wrap/sweep_config.py` (`FM_CHECKPOINT_BASENAME`), or pass `--fm-checkpoint` to use one file for all sizes while testing.
+3. **GPU** — finetune defaults assume CUDA; use `finetune_MORPH.py --device_idx` / `--parallel` as in upstream docs.
 
-The MORPH repository should be cloned or symlinked at `morph/MORPH/`. Per-trajectory data files (`0000__data.npy` … `0999__data.npy`) should already exist in `MORPH/datasets/SW2d/`.
+## Preparing data
 
----
+MORPH finetuning expects data under a **dataset root** (usually the MORPH project root) in the **normalized / RevIN** layout used by the official dataloaders, e.g. paths like:
 
-## Detailed workflow
+`MORPH/datasets/normalized_revin/<dataset_folder>/train/…`
 
-### Step 1 — Preprocessing (`src/preprocess.py`)
+**Steps (high level):**
 
-Packs the 1000 individual trajectory files into consolidated NumPy arrays and splits them at the trajectory level to prevent temporal leakage.
+1. **Download** the archives from DARUS (links above). HDF5 layout and shapes are summarized in `specs/plan.md` (e.g. BE1D `tensor`, SW groups `0000/data`, CFD fields `Vx`, …).
+2. **Preprocess** into the folder names and tensor layout that MORPH’s loaders expect (`MORPH/src/utils/dataloaders/` — e.g. `dataloader_be1d.py`, `dataloader_sw2d.py`, CFD3D-turb). Upstream preprocessing notes are in `MORPH/docs`.
+3. **Point the sweep** at that tree with `--dataset-root` (defaults to `./MORPH` if data lives inside the clone).
 
-**What it does:**
+**Trajectory pool:** `TRAJECTORY_POOL` in `code/morph_wrap/sweep_config.py` should match the **number of trajectories in the train split** you actually load (`train_data.shape[0]` in `finetune_MORPH.py`). The sweep sets `--n_traj` to `max(1, int(pool * train_frac / 100))`. If `pool` is too large, `n_traj` can exceed the real train size.
 
-1. Loads all `????__data.npy` files from `MORPH/datasets/SW2d/` (or from a raw HDF5 via `--h5`).
-2. Validates every trajectory: shape `(101, 128, 128, 1)`, `float32`, all finite.
-3. Performs a group-wise train/val/test split (default 80/10/10, seeded for reproducibility).
-4. Saves four `.npy` files and a JSON manifest.
+**Norm stats:** MORPH expects RevIN / `stats_*` files under `MORPH/data/` per dataset; follow upstream preparation so finetuning does not fail on missing statistics.
 
-**Outputs** (in `MORPH/datasets/`):
+## Configure the sweep
 
-| File | Shape | Purpose |
-|------|-------|---------|
-| `shallow_water_train.npy` | (800, 101, 128, 128, 1) | Training split |
-| `shallow_water_val.npy` | (100, 101, 128, 128, 1) | Validation split |
-| `shallow_water_test.npy` | (100, 101, 128, 128, 1) | Test split |
-| `shallow_water_all.npy` | (1000, 101, 128, 128, 1) | Combined (for compat with `finetune_MORPH_general.py`) |
-| `shallow_water_manifest.json` | — | Records N, T, H, W, split seed, dataset_specs |
+Edit `code/morph_wrap/sweep_config.py`:
 
-**Key arguments:**
+- **`TRAJECTORY_POOL`** — train-split trajectory counts (see above).
+- **`FM_CHECKPOINT_BASENAME`** — FM checkpoint filename per model size (`Ti` / `S` / `L`).
+- **`LR_TABLE`** — pilot learning rates after your **per-(dataset, model, context)** search (`specs/issues.md` I5); the manifest logs these; MORPH’s level-1–3 optimizer LRs are still defined in `MORPH/src/utils/select_fine_tuning_parameters.py` unless you patch them to read env (e.g. `MORPH_PILOT_LR` set by the driver).
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--sw2d-dir` | `MORPH/datasets/SW2d` | Source directory of per-trajectory files |
-| `--h5` | — | Alternative: raw HDF5 file |
-| `--out-dir` | `MORPH/datasets` | Where to write outputs |
-| `--name` | `shallow_water` | Filename prefix |
-| `--seed` | `42` | Split RNG seed |
-| `--train-ratio` | `0.8` | Fraction for training |
-| `--val-ratio` | `0.1` | Fraction for validation |
-| `--test-ratio` | `0.1` | Fraction for testing |
-| `--skip-all` | off | Skip writing the combined `_all.npy` |
+## Quick start
 
-**Example:**
+From this repo root (activate your MORPH conda env first):
 
 ```bash
-# Default (reads SW2d folder, writes to MORPH/datasets/)
-python src/preprocess.py
+# List commands for the first N jobs (no training)
+PYTHONPATH=code python -m morph_wrap.run_sweep --sweep A --dry-run --limit 5
 
-# Custom split
-python src/preprocess.py --train-ratio 0.9 --val-ratio 0.05 --test-ratio 0.05
+# Full Sweep A manifest + print all 72 commands
+PYTHONPATH=code python -m morph_wrap.run_sweep --sweep A --dry-run
+
+# Run jobs (sequential; each invokes MORPH/finetune_MORPH.py)
+PYTHONPATH=code python -m morph_wrap.run_sweep --sweep A --execute \
+  --morph-root MORPH --dataset-root MORPH
 ```
 
----
-
-### Step 2 — Training (`src/train_step.py`)
-
-Single-step (teacher-forced) fine-tuning of MORPH. Learns the mapping from an `ar_order`-length context window to the next frame, using MSE loss on RevIN-normalised data.
-
-**What it does:**
-
-1. Loads the preprocessed splits produced by Step 1.
-2. Converts to MORPH's UPTF7 tensor layout `(N, T, F, C, D, H, W)`.
-3. Computes RevIN normalisation statistics over all trajectories (saved to `MORPH/data/` for later use by evaluation).
-4. Creates autoregressive (input, target) pairs via sliding window.
-5. Builds a `ViT3DRegression` model, loads foundation-model weights (optionally downloaded from HuggingFace), and applies the chosen fine-tuning level.
-6. Trains with early stopping; saves checkpoints only when validation loss improves.
-7. After training, **reloads the best checkpoint** and evaluates on the test set.
-8. Writes structured metrics (JSON + plain text) and a loss-curve plot.
-
-**Outputs:**
-
-| Artifact | Location |
-|----------|----------|
-| Best checkpoint | `MORPH/models/shallow_water/ft_morph-..._best.pth` |
-| RevIN stats | `MORPH/data/norm_shallow_water_mu.npy`, `…_var.npy` |
-| Metrics (JSON) | `MORPH/experiments/results/test/shallow_water/metrics_*.json` |
-| Metrics (text) | `…/metrics_*.txt` |
-| Loss curve | `…/loss_*.png` |
-
-**Key arguments:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--download-model` | off | Download FM checkpoint from HuggingFace |
-| `--model-size` | `Ti` | `Ti`, `S`, `M`, or `L` |
-| `--ckpt-from` | `FM` | `FM` (foundation model) or `FT` (resume from fine-tuned) |
-| `--checkpoint` | — | Explicit `.pth` path for `FT` resume |
-| `--ft-level1` | off | LoRA + LayerNorm + positional encoding |
-| `--ft-level2` | off | + Encoder (conv, proj, cross-attention) |
-| `--ft-level3` | off | + Decoder linear |
-| `--ft-level4` | off | Full model (all parameters unfrozen) |
-| `--ar-order` | `1` | Context window length |
-| `--max-ar-order` | `1` | Model's maximum AR order |
-| `--n-epochs` | `150` | Maximum training epochs |
-| `--batch-size` | `8` | Per-GPU batch size |
-| `--lr` | `1e-4` | Learning rate |
-| `--lr-scheduler` | off | ReduceLROnPlateau |
-| `--patience` | `10` | Early-stopping patience |
-| `--n-traj` | all | Limit training trajectories |
-| `--overwrite-weights` | off | Save as `_best.pth` instead of `_ep{N}.pth` |
-
-**Recommended first run:**
+After you have rollout metrics in a CSV (columns at least `run_id`, `rollout_step`, `mse`, `dataset`, `context_frames`):
 
 ```bash
-python src/train_step.py \
-  --download-model \
-  --ft-level1 \
-  --model-size Ti \
-  --n-epochs 50 \
-  --patience 10 \
-  --lr-scheduler \
-  --overwrite-weights
+PYTHONPATH=code python -m morph_wrap.pick_context \
+  --rollout-csv out/sweepA_rollout.csv \
+  --out out/sweep_b_context.json
 ```
 
-**Resuming from a fine-tuned checkpoint:**
+Sweep B (default: **96** tiny+small jobs; **144** with `--include-large`):
 
 ```bash
-python src/train_step.py \
-  --ckpt-from FT \
-  --checkpoint ft_morph-Ti-shallow_water-..._best.pth \
-  --ft-level1 --ft-level2 \
-  --n-epochs 100
+PYTHONPATH=code python -m morph_wrap.run_sweep --sweep B --dry-run \
+  --context-json out/sweep_b_context.json
 ```
 
----
+Example context JSON: `code/morph_wrap/examples/sweep_b_context.example.json`.
 
-### Step 3 — Evaluation (`src/evaluate.py`)
+Manifests are written under `out/sweep_*_manifest_*.csv` (command, `lr_pilot_table`, `fm_checkpoint_basename`, etc.).
 
-Standalone inference script that loads a trained checkpoint and produces comprehensive metrics and visualisations. Designed to run independently from training.
+## HPC / batch jobs (Slurm and similar)
 
-**What it does:**
+The sweep driver is **stdout/stderr friendly**: finetune subprocesses **inherit** your terminal (or Slurm’s `#SBATCH -o/-e` files). Failures also append **structured JSON lines** to `out/sweep_failures.jsonl` (override with `--failure-log`).
 
-1. Loads preprocessed test data and recomputes RevIN stats (using the same train+val+test concatenation order as training, so stats are consistent).
-2. **Single-step evaluation**: teacher-forced next-frame prediction on all test pairs.
-   - Reports MSE, MAE, RMSE (normalised) and VRMSE, NRMSE (denormalised).
-3. **Rollout evaluation**: starting from the first ground-truth frame, autoregressively predicts `K` steps.
-   - Tracks per-horizon RMSE averaged over all test trajectories.
-   - Reveals drift and stability characteristics.
-4. Generates visualisations for a selected test trajectory:
-   - GIFs of actual and predicted rollout sequences
-   - Actual / Predicted / Diff triptych at key timesteps
-   - Multi-column evolution grid (actual vs predicted)
-   - Per-horizon RMSE curve plot
-5. Saves predictions as `.npy` for further analysis or custom plotting.
+### Dependencies
 
-**Outputs** (in `out/eval/shallow_water/`):
+- **`morph_wrap`** uses only the Python **standard library** (see root `requirements.txt`).  
+- **Training** needs the full **MORPH** stack (PyTorch, etc.) via `MORPH/environment.yml` or your site’s modules + venv.
 
-| File | Description |
-|------|-------------|
-| `metrics_eval_s0_h50.json` | All metrics (single-step + rollout) |
-| `rollout_actual_s0_h50.npy` | Ground-truth frames `(K, H, W)` |
-| `rollout_pred_s0_h50.npy` | Predicted frames `(K, H, W)` |
-| `gif_actual_s0_h50.gif` | Animated ground truth |
-| `gif_rollout_s0_h50.gif` | Animated rollout predictions |
-| `diff_t001_s0_h50.png` … | Actual / predicted / diff triptych |
-| `grid_s0_h50.png` | Strided evolution grid |
-| `rollout_rmse_curve_s0_h50.png` | Error vs rollout step |
+### Optional environment modules
 
-**Key arguments:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--checkpoint` | *(required)* | Path to `.pth` (absolute or relative to `MORPH/models/<name>/`) |
-| `--rollout-horizon` | `20` | Number of autoregressive steps |
-| `--test-sample` | `0` | Test trajectory index for detailed visualisation |
-| `--out-dir` | `out/eval/<name>/` | Output directory |
-| `--ft-level1` … | — | Must match the architecture used during training |
-| `--model-size` | `Ti` | Must match training |
-
-**Example:**
+Many clusters use Lmod / Environment Modules. Set a space-separated list and source the helper **before** `conda activate`:
 
 ```bash
-python src/evaluate.py \
-  --checkpoint ft_morph-Ti-shallow_water-ar1_max_ar1_lora16_ftlev1_lr0.0001_wd0.0_best.pth \
-  --ft-level1 \
-  --rollout-horizon 50 \
-  --test-sample 5
+export MORPH_HPC_MODULES="cuda/12.1 cudnn/9.0 gcc/11"
+source scripts/hpc/load_modules.sh
 ```
 
----
+If `module` is missing (e.g. laptop), the script **warns and continues**. If a listed module **fails to load**, the script **exits 1** with a clear stderr message.
 
-### Visualisation (`src/visualize.py`)
+### One job per finetune (recommended for long runs)
 
-Both a **library** of plotting functions (imported by `evaluate.py`) and a **standalone CLI** for ad-hoc visualisation of any sequence.
-
-**Library functions** (importable):
-
-| Function | Input | Output |
-|----------|-------|--------|
-| `render_sequence_gif(seq, path, ...)` | `(T, H, W)` numpy array | GIF file |
-| `plot_diff_frame(actual, pred, ...)` | Two `(H, W)` frames | PNG with actual/predicted/diff panels |
-| `plot_sequence_grid(actual_seq, pred_seq, ...)` | Two `(T, H, W)` arrays | PNG grid with stride |
-
-**CLI modes:**
+1. On a login node, generate a **fixed manifest** (bounds your array size). Do **not** use `--limit` if the job array must cover the full sweep.
 
 ```bash
-# Animate a .npy predicted rollout
-python src/visualize.py --npy out/eval/shallow_water/rollout_pred_s0_h50.npy
-
-# Animate a raw HDF5 group
-python src/visualize.py --h5 ../data/shallow_data.h5 --group 0042
-
-# Single frame from .npy
-python src/visualize.py --npy rollout.npy --t 10 --out frame10.png
+export PYTHONPATH=code
+python -m morph_wrap.run_sweep --sweep A --dry-run \
+  --manifest-csv out/sweep_A_manifest.csv
+# Array size: number of data rows = (wc -l < manifest.csv) - 1
 ```
 
----
+2. Submit a **job array** so each task runs **one** row (1-based task id):
 
-## Shallow-water dataset specs
+```bash
+export PYTHONUNBUFFERED=1   # timely logs when redirecting stdout
+python -m morph_wrap.run_sweep \
+  --manifest-csv out/sweep_A_manifest.csv \
+  --use-slurm-array-task-id --array-base 1 \
+  --execute --morph-root MORPH --dataset-root MORPH \
+  --out-dir out \
+  --summary-log out/sweep_slurm_summary.log
+```
 
-| Parameter | Value |
-|-----------|-------|
-| Trajectories (N) | 1000 |
-| Timesteps per trajectory (T) | 101 |
-| Spatial resolution (H x W) | 128 x 128 |
-| Fields (F) | 1 (water height) |
-| Components (C) | 1 |
-| Depth (D) | 1 (2-D data) |
-| `--dataset-specs` | `1 1 1 128 128` |
+Or pass an explicit index: `--execute-job-index 17 --array-base 1`.
 
-## MORPH model sizes
+3. Optional prolog (same conda env as training):
 
-| Size | Params | dim | heads | depth | mlp_dim |
-|------|--------|-----|-------|-------|---------|
-| Ti | ~10.5 M | 256 | 4 | 4 | 1024 |
-| S | ~33 M | 512 | 8 | 4 | 2048 |
-| M | ~86 M | 768 | 12 | 8 | 3072 |
-| L | ~200 M | 1024 | 16 | 16 | 4096 |
+```bash
+python -m morph_wrap.env_check --require-cuda
+```
 
-## Fine-tuning levels
+### Sequential batch on one node
 
-| Level | What is unfrozen | Typical use |
-|-------|-----------------|-------------|
-| 1 | LoRA (A/B), LayerNorms, positional encoding | Start here — cheap, effective |
-| 1+2 | + Convolutional encoder, projection, cross-attention | If level 1 plateaus |
-| 1+2+3 | + Decoder linear layer | More capacity |
-| 4 | Full model (all parameters) | Last resort; risk of overfitting |
+```bash
+python -m morph_wrap.run_sweep --sweep A --execute \
+  --continue-on-failure \
+  --failure-log out/sweep_failures.jsonl \
+  --summary-log out/sweep_batch_summary.log
+```
 
-## Escalation path (if rollouts drift)
+Non-zero exit after the batch if **any** job failed (`--continue-on-failure`); without it, the driver stops at the **first** failure.
 
-1. Increase `--ar-order` (e.g. 2 or 4) with a matching `--max-ar-order`
-2. Add fine-tuning depth (level 2, then 3)
-3. Regularise: keep LoRA rank moderate, add `--lr-scheduler`
-4. Escalate to sequence training (`specs/train_seq.md` — not yet implemented)
+### Site template
+
+See `scripts/hpc/slurm_array_example.sbatch` and `scripts/hpc/load_modules.sh` (edit paths, partition, conda, array range).
+
+### GPU index on multi-GPU nodes
+
+Slurm usually sets `CUDA_VISIBLE_DEVICES`; keep `--device-index 0` (default). Override with `--device-index` or export **`MORPH_DEVICE_IDX`**.
+
+## Documentation map
+
+| File | Contents |
+|------|----------|
+| `specs/plan.md` | Datasets, sweep grids, metrics sketch |
+| `specs/design.md` | Implementation-facing design, CSV schemas, checklist |
+| `specs/issues.md` | Locked design choices (wrapper, context, staging, …) |
+
+## Citation
+
+If you use MORPH, cite the upstream paper linked from `MORPH/README.md` and respect LANL / dataset licenses for your sources.
