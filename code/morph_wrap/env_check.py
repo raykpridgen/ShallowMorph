@@ -42,15 +42,19 @@ def main() -> int:
     print(f"env_check: cuda.is_available = {cuda_ok}")
     if cuda_ok:
         n = torch.cuda.device_count()
-        print(f"env_check: device_count = {n}")
+        print(f"env_check: torch.cuda.device_count() = {n}")
         for i in range(n):
             name = torch.cuda.get_device_name(i)
-            print(f"env_check: device {i}: {name}")
+            print(f"env_check: logical device {i}: {name}")
+        if n > 0:
+            cur = torch.cuda.current_device()
+            print(f"env_check: torch.cuda.current_device() = {cur}")
         if args.min_free_gb > 0 and n > 0:
             try:
-                free, _total = torch.cuda.mem_get_info(0)
+                dev = torch.cuda.current_device()
+                free, _total = torch.cuda.mem_get_info(dev)
                 free_gb = free / (1024**3)
-                print(f"env_check: cuda:0 free_mem_gb ≈ {free_gb:.2f}")
+                print(f"env_check: cuda:{dev} free_mem_gb ≈ {free_gb:.2f}")
                 if free_gb < args.min_free_gb:
                     print(
                         f"env_check: WARNING free_mem_gb {free_gb:.2f} < {args.min_free_gb}",

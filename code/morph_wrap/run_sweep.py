@@ -26,6 +26,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+from morph_wrap.device_resolve import (
+    format_device_resolution_log,
+    resolve_training_device_index,
+)
 from morph_wrap.hpc_util import append_failure_log, append_summary_line, load_manifest_entries
 from morph_wrap.morph_cli import finetune_argv, finetune_env
 from morph_wrap.sweep_config import (
@@ -229,9 +233,16 @@ def main() -> int:
     p.add_argument("--out-dir", type=Path, default=root / "out")
     p.add_argument(
         "--device-index",
-        type=int,
-        default=int(os.environ.get("MORPH_DEVICE_IDX", "0")),
-        help="CUDA device index for finetune (default: env MORPH_DEVICE_IDX or 0)",
+        type=str,
+        default="auto",
+        metavar="auto|INT",
+        help="MORPH --device_idx: 'auto' = MORPH_DEVICE_IDX if set, else torch.cuda.current_device() "
+        "(see torch.cuda.device_count()); else integer index",
+    )
+    p.add_argument(
+        "--quiet-device",
+        action="store_true",
+        help="Suppress stderr line showing resolved --device_idx",
     )
     p.add_argument(
         "--continue-on-failure",
@@ -270,6 +281,34 @@ def main() -> int:
     )
 
     args = p.parse_args()
+
+    di_raw = args.device_index.strip().lower()
+    if di_raw == "auto":
+        explicit_dev: int | None = None
+    else:
+        try:
+            explicit_dev = int(args.device_index)
+        except ValueError:
+            print(
+                f"Invalid --device-index {args.device_index!r}; use 'auto' or an integer.",
+                file=sys.stderr,
+            )
+            return 2
+        if explicit_dev < 0:
+            print("--device-index must be >= 0", file=sys.stderr)
+            return 2
+
+    device_idx, dev_info = resolve_training_device_index(explicit_dev)
+    if not args.quiet_device:
+        print(
+            format_device_resolution_log(
+                device_idx,
+                dev_info,
+                explicit_cli=explicit_dev is not None,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
 
     morph_root = args.morph_root.resolve()
     out_dir = args.out_dir.resolve()
@@ -332,7 +371,7 @@ def main() -> int:
             morph_root=morph_root,
             dataset_root=args.dataset_root.resolve(),
             fm_checkpoint=entry.fm_checkpoint,
-            device_idx=args.device_index,
+            device_idx=device_idx,
         )
         cmd_str = " ".join([sys.executable, *argv])
         print(f"[manifest row {row_index + 1}/{len(entries)}] {job.run_id}")
@@ -415,7 +454,7 @@ def main() -> int:
             morph_root=morph_root,
             dataset_root=args.dataset_root.resolve(),
             fm_checkpoint=ck,
-            device_idx=args.device_index,
+            device_idx=device_idx,
         )
         argv_rows.append(argv)
         cmd_strings.append(" ".join([sys.executable, *argv]))

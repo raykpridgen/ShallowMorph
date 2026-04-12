@@ -19,7 +19,7 @@ def finetune_argv(
     ckpt_from: str = "FM",
     parallel: str = "dp",
     patience: int = 10_000,
-    device_idx: int = 0,
+    device_idx: int = 0,  # pass value from morph_wrap.device_resolve.resolve_training_device_index
     ft_level1: bool = True,
     ft_level2: bool = True,
     ft_level3: bool = True,

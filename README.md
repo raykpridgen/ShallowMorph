@@ -165,9 +165,11 @@ Non-zero exit after the batch if **any** job failed (`--continue-on-failure`); w
 
 See `scripts/hpc/slurm_array_example.sbatch` and `scripts/hpc/load_modules.sh` (edit paths, partition, conda, array range).
 
-### GPU index on multi-GPU nodes
+### GPU index (Slurm / CUDA visibility)
 
-Slurm usually sets `CUDA_VISIBLE_DEVICES`; keep `--device-index 0` (default). Override with `--device-index` or export **`MORPH_DEVICE_IDX`**.
+By default, `run_sweep` uses **`--device-index auto`**: after optional `MORPH_DEVICE_IDX`, it sets MORPH’s `--device_idx` from **`torch.cuda.current_device()`**, with **`torch.cuda.device_count()`** used for validation and logging. On typical Slurm GPU jobs, the scheduler sets `CUDA_VISIBLE_DEVICES`, PyTorch exposes **one** logical GPU as `cuda:0`, and `current_device()` is **0** — that is the index passed to finetune.
+
+Override when needed: `--device-index 1` or `export MORPH_DEVICE_IDX=1` (env wins over torch only when using `auto`). Suppress the resolution line with **`--quiet-device`**.
 
 ## Documentation map
 
