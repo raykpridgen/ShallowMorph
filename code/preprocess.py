@@ -2,7 +2,7 @@
 """
 Prepare raw DARUS-style HDF5 files for MORPH finetuning (this repo's sweep).
 
-Mirrors the BE1D, shallow-water 2D, and CFD3D-turb sections of
+Mirrors the BE1D, shallow-water 2D, and DR2D sections of
 ``MORPH/scripts/data_normalization_revin.py`` by calling the same
 ``split_and_save_h5``, dataloader, and ``RevIN`` code paths.
 
@@ -11,15 +11,15 @@ Expected raw layouts match ``specs/plan.md``:
 * **BE1D** — dataset ``tensor`` with shape ``(N, T, W)`` e.g. ``(10000, 201, 1024)``.
 * **SW** — groups ``0000`` … each with dataset ``data`` shaped ``(T, H, W, C)`` e.g.
   ``(101, 128, 128, 1)``.
-* **CFD3D-TURB** — datasets ``Vx``, ``Vy``, ``Vz``, ``density``, ``pressure`` each
-  ``(N, T, D, H, W)`` e.g. ``(600, 21, 64, 64, 64)``.
+* **DR2D** (diffusion–reaction 2D) — same HDF5 layout as SW; ``data`` shaped
+  ``(101, 128, 128, 2)``.
 
 Usage (from repo root, MORPH conda env active)::
 
-    python code/preprocess.py --morph-root MORPH --be1d raw/1D.hdf5 --sw raw/2D.hdf5 \\
-        --cfd3d-turb raw/3D.hdf5
+    python code/preprocess.py --morph-root MORPH --be1d raw/1D.hdf5 --sw raw/2D_SW.hdf5 \\
+        --dr2d raw/2D_DR.hdf5
 
-Outputs under ``<morph-root>/datasets/normalized_revin/{1dbe_pdebench,2dSW_pdebench,3dcfd_turb_pdebench}/``
+Outputs under ``<morph-root>/datasets/normalized_revin/{1dbe_pdebench,2dSW_pdebench,DR2d_data_pdebench}/``
 with ``train/``, ``val/``, ``test/``, and RevIN statistics under ``<morph-root>/data/``.
 """
 
@@ -48,9 +48,9 @@ _EXPECTED = {
         "data_tail": (101, 128, 128, 1),  # (T, H, W, C)
         "describe": "group '####/data' (101, 128, 128, 1) float32",
     },
-    "cfd3d_turb": {
-        "field_tail": (21, 64, 64, 64),  # (T, D, H, W)
-        "describe": "Vx,Vy,Vz,density,pressure each (N, 21, 64, 64, 64) float32",
+    "dr2d": {
+        "data_tail": (101, 128, 128, 2),  # (T, H, W, C)
+        "describe": "group '####/data' (101, 128, 128, 2) float32",
     },
 }
 
@@ -109,20 +109,26 @@ def _validate_sw(path: Path, strict: bool) -> None:
             print(f"warning: {msg}", file=sys.stderr)
 
 
-def _validate_cfd3d_turb(path: Path, strict: bool) -> None:
-    exp = _EXPECTED["cfd3d_turb"]["field_tail"]
-    names = ("Vx", "Vy", "Vz", "density", "pressure")
+def _validate_dr2d(path: Path, strict: bool) -> None:
+    exp = _EXPECTED["dr2d"]["data_tail"]
     with h5py.File(path, "r") as f:
-        for n in names:
-            if n not in f:
-                msg = f"{path}: missing dataset {n!r}"
-                if strict:
-                    raise ValueError(msg)
-                print(f"warning: {msg}", file=sys.stderr)
-                return
-        sh0 = f["Vx"].shape
-        if len(sh0) != 5 or sh0[1:] != exp:
-            msg = f"{path}: Vx shape {sh0}, expected (N, {exp[0]}, {exp[1]}, {exp[2]}, {exp[3]})"
+        keys = sorted(k for k in f.keys() if not k.startswith("."))
+        if not keys:
+            msg = f"{path}: no top-level groups"
+            if strict:
+                raise ValueError(msg)
+            print(f"warning: {msg}", file=sys.stderr)
+            return
+        first = keys[0]
+        if "data" not in f[first]:
+            msg = f"{path}: group {first!r} missing 'data'"
+            if strict:
+                raise ValueError(msg)
+            print(f"warning: {msg}", file=sys.stderr)
+            return
+        sh = f[first]["data"].shape
+        if sh != exp:
+            msg = f"{path}: {first}/data shape {sh}, expected {exp}"
             if strict:
                 raise ValueError(msg)
             print(f"warning: {msg}", file=sys.stderr)
@@ -277,97 +283,79 @@ def _run_sw(
             out_path.unlink()
 
 
-def _run_cfd3d_turb(
+def _run_dr2d(
     morph_root: Path,
     raw_file: Path,
     *,
     force: bool,
     skip_roundtrip: bool,
 ) -> None:
-    from src.utils.dataloaders.dataloader_cfd3d_turb import CFD3dTurbDataLoader, split_and_save_h5
+    from src.utils.dataloaders.dataloader_dr import DR2DDataLoader, split_and_save_h5
     from src.utils.normalization import RevIN
 
-    norm_dir = morph_root / "datasets" / "normalized_revin" / "3dcfd_turb_pdebench"
+    norm_dir = morph_root / "datasets" / "normalized_revin" / "DR2d_data_pdebench"
     stats_dir = morph_root / "data"
     os.makedirs(stats_dir, exist_ok=True)
     _prepare_out_dir(norm_dir, force)
 
     rev = RevIN(stats_dir)
-    tol = 7e-5
+    tol = 1e-5
 
-    with tempfile.TemporaryDirectory(prefix="morph_cfd3d_", dir=morph_root / "datasets") as td:
+    with tempfile.TemporaryDirectory(prefix="morph_dr2d_", dir=morph_root / "datasets") as td:
         work = Path(td)
         shutil.copy2(raw_file, work / raw_file.name)
 
         split_and_save_h5(
-            raw_dir=os.fspath(work),
-            out_dir=os.fspath(work),
-            select_nfiles=1,
+            raw_h5_loadpath=os.fspath(work),
+            savepath=os.fspath(work),
+            dataset_name="DR",
             train_frac=0.8,
             rand=True,
         )
 
-        loader = CFD3dTurbDataLoader(data_path=os.fspath(work), dataset_name="CFD3dTurb")
+        loader = DR2DDataLoader(os.fspath(work), dataset_name="DR")
         train, val = loader.split_train()
         test = loader.split_test()
         dataset = np.concatenate((train, val, test), axis=0)
         del train, val, test
 
-        dataset = dataset.transpose(0, 1, 6, 5, 2, 3, 4)
-        rev.compute_stats(dataset, prefix="stats_cfd3d-turb")
-        dataset_n = rev.normalize(dataset, prefix="stats_cfd3d-turb")
+        dataset_tr = dataset.transpose(0, 1, 6, 5, 2, 3, 4)
+        rev.compute_stats(dataset_tr, prefix="stats_dr2d")
+        dataset_n = rev.normalize(dataset_tr, prefix="stats_dr2d")
 
         if not skip_roundtrip:
-            max_err = 0.0
-            recovered = rev.denormalize(dataset_n, prefix="stats_cfd3d-turb")
-            for i in range(recovered.shape[0]):
-                max_err = max(max_err, float(np.max(np.abs(recovered[i] - dataset[i]))))
+            recovered = rev.denormalize(dataset_n, prefix="stats_dr2d")
+            max_err = max(
+                float(np.max(np.abs(recovered[i] - dataset_tr[i]))) for i in range(recovered.shape[0])
+            )
             del recovered
-            assert max_err < tol, f"CFD3D-TURB RevIN round-trip max error {max_err} >= {tol}"
+            assert max_err < tol, f"DR2D RevIN round-trip max error {max_err} >= {tol}"
 
         dataset_sq = dataset_n.transpose(0, 1, 4, 5, 6, 3, 2)
+        dataset_sq = np.squeeze(dataset_sq, axis=2)[:, :, :, :, 0, :]
 
-        raw_files = sorted(
-            f for f in os.listdir(work) if f.endswith(".h5") or f.endswith(".hdf5")
-        )
-        splits = len(raw_files)
-        n = dataset_sq.shape[0]
-        chunk_size = n // splits if splits else n
-
-        for i, fname in enumerate(raw_files):
-            start = i * chunk_size
-            end = (i + 1) * chunk_size if i != len(raw_files) - 1 else n
-            chunk = dataset_sq[start:end]
-
-            out_path = norm_dir / fname
-            with h5py.File(out_path, "w") as f5:
-                vel_chunk = chunk[..., 0]
-                vx_chunk, vy_chunk, vz_chunk = vel_chunk[..., 0], vel_chunk[..., 1], vel_chunk[..., 2]
-                den_chunk = chunk[..., 0, 1]
-                pre_chunk = chunk[..., 0, 2]
-                f5.create_dataset("Vx", data=vx_chunk, compression="gzip")
-                f5.create_dataset("Vy", data=vy_chunk, compression="gzip")
-                f5.create_dataset("Vz", data=vz_chunk, compression="gzip")
-                f5.create_dataset("density", data=den_chunk, compression="gzip")
-                f5.create_dataset("pressure", data=pre_chunk, compression="gzip")
+        raw_top = [f for f in os.listdir(work) if f.endswith(".h5") or f.endswith(".hdf5")]
+        filename = sorted(raw_top)[0]
+        out_path = norm_dir / filename
+        with h5py.File(out_path, "w") as f_out:
+            for i in range(dataset_sq.shape[0]):
+                grp = f_out.create_group(f"{i:04d}")
+                grp.create_dataset("data", data=dataset_sq[i], compression="lzf")
 
         split_and_save_h5(
-            raw_dir=os.fspath(norm_dir),
-            out_dir=os.fspath(norm_dir),
-            select_nfiles=1,
-            dataset_name="cfd3d_turb",
+            raw_h5_loadpath=os.fspath(norm_dir),
+            savepath=os.fspath(norm_dir),
+            dataset_name="DR",
             train_frac=0.8,
             rand=False,
         )
-        for fname in raw_files:
-            p = norm_dir / fname
-            if p.is_file():
-                p.unlink()
+        if out_path.is_file():
+            out_path.unlink()
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(
-        description="Raw DARUS HDF5 → MORPH normalized_revin + RevIN stats (BE1D, SW, CFD3D-TURB)."
+        description="Raw DARUS HDF5 → MORPH normalized_revin + RevIN stats (BE1D, SW, DR2D)."
     )
     p.add_argument(
         "--morph-root",
@@ -378,10 +366,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--be1d", type=Path, metavar="FILE", help="Raw BE1D (Burgers) .h5 / .hdf5")
     p.add_argument("--sw", type=Path, metavar="FILE", help="Raw shallow-water 2D .h5 / .hdf5")
     p.add_argument(
-        "--cfd3d-turb",
+        "--dr2d",
         type=Path,
         metavar="FILE",
-        help="Raw compressible 3D turbulent .h5 / .hdf5",
+        help="Raw diffusion–reaction 2D PDEBench .h5 / .hdf5 (see specs/plan.md)",
     )
     p.add_argument(
         "--force",
@@ -416,11 +404,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         jobs.append(("BE1D", args.be1d, _run_be1d))
     if args.sw is not None:
         jobs.append(("SW", args.sw, _run_sw))
-    if args.cfd3d_turb is not None:
-        jobs.append(("CFD3D-TURB", args.cfd3d_turb, _run_cfd3d_turb))
+    if args.dr2d is not None:
+        jobs.append(("DR2D", args.dr2d, _run_dr2d))
 
     if not jobs:
-        p.error("pass at least one of --be1d, --sw, --cfd3d-turb")
+        p.error("pass at least one of --be1d, --sw, --dr2d")
 
     (morph_root / "datasets").mkdir(parents=True, exist_ok=True)
 
@@ -439,7 +427,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         elif name == "SW":
             _validate_sw(path, args.strict_shapes)
         else:
-            _validate_cfd3d_turb(path, args.strict_shapes)
+            _validate_dr2d(path, args.strict_shapes)
 
         if args.validate_only:
             print(f"ok: {name} shape check passed for {path}")
@@ -460,7 +448,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"→ RevIN stats under {morph_root / 'data'}", flush=True)
     print(
         "→ normalized splits under "
-        f"{morph_root / 'datasets' / 'normalized_revin'}/{{1dbe_pdebench,2dSW_pdebench,3dcfd_turb_pdebench}}",
+        f"{morph_root / 'datasets' / 'normalized_revin'}/{{1dbe_pdebench,2dSW_pdebench,DR2d_data_pdebench}}",
         flush=True,
     )
     return 0

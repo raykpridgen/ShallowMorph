@@ -47,7 +47,7 @@ def _parse_manifest_row(row: dict[str, str]) -> ManifestEntry:
     ds = row["dataset"].strip()
     mk = row["model"].strip()
     sw = row["sweep"].strip()
-    if ds not in ("BE1D", "SW2D", "CFD3D"):
+    if ds not in ("BE1D", "SW2D", "DR2D"):
         raise ValueError(f"Invalid dataset {ds!r} in manifest")
     if mk not in ("tiny", "small", "large"):
         raise ValueError(f"Invalid model {mk!r} in manifest")

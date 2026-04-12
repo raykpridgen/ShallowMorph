@@ -12,16 +12,16 @@ from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, Literal, Optional, Tuple
 
 SweepName = Literal["A", "B"]
-DatasetKey = Literal["BE1D", "SW2D", "CFD3D"]
+DatasetKey = Literal["BE1D", "SW2D", "DR2D"]
 ModelKey = Literal["tiny", "small", "large"]
 
 # Order matches specs/plan.md nested loops.
-DATASET_ORDER: Tuple[DatasetKey, ...] = ("BE1D", "SW2D", "CFD3D")
+DATASET_ORDER: Tuple[DatasetKey, ...] = ("BE1D", "SW2D", "DR2D")
 
 MORPH_FT_DATASET: Dict[DatasetKey, str] = {
     "BE1D": "BE1D",
     "SW2D": "SW",
-    "CFD3D": "CFD3D-TURB",
+    "DR2D": "DR2D",
 }
 
 MORPH_MODEL_SIZE: Dict[ModelKey, str] = {
@@ -41,14 +41,14 @@ FM_CHECKPOINT_BASENAME: Dict[ModelKey, str] = {
 TRAJECTORY_POOL: Dict[DatasetKey, int] = {
     "BE1D": 7000,
     "SW2D": 700,
-    "CFD3D": 420,
+    "DR2D": 700,
 }
 
 # Canonical shape strings for runs.csv (from specs/plan.md / design §2.2).
 DATA_DIMS: Dict[DatasetKey, str] = {
     "BE1D": "(10000,201,1024) raw tensor / MORPH inflated",
     "SW2D": "(101,128,128,1) per group HDF5",
-    "CFD3D": "(600,21,64,64,64) per field HDF5",
+    "DR2D": "(101,128,128,2) per group HDF5 (diffusion–reaction 2D)",
 }
 
 # Learning rates after pilot (I5-C). Keys: (dataset, model_key, context_frames).

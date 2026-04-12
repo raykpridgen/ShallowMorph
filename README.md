@@ -10,7 +10,7 @@ This repository wraps [LANL MORPH](https://github.com/lanl/MORPH) (`./MORPH`) to
 |-----------|-------------------|----------------|
 | Burgers 1D | `BE1D` | [datafile 268187](https://darus.uni-stuttgart.de/api/access/datafile/268187) |
 | Shallow water 2D | `SW` | [datafile 133021](https://darus.uni-stuttgart.de/api/access/datafile/133021) |
-| Compressible 3D (turb.) | `CFD3D-TURB` | [datafile 164694](https://darus.uni-stuttgart.de/api/access/datafile/164694) |
+| Diffusion–reaction 2D | `DR2D` | [datafile 133017](https://darus.uni-stuttgart.de/api/access/datafile/133017) |
 
 **Sweep A (72 jobs):** context ∈ {1, 5, 10} frames, train fraction {10%, 50%}, epochs {10, 50}, models {tiny, small}.
 
@@ -48,8 +48,8 @@ MORPH finetuning expects data under a **dataset root** (usually the MORPH projec
 
 **Steps (high level):**
 
-1. **Download** the archives from DARUS (links above). HDF5 layout and shapes are summarized in `specs/plan.md` (e.g. BE1D `tensor`, SW groups `0000/data`, CFD fields `Vx`, …).
-2. **Preprocess** into the folder names and tensor layout that MORPH’s loaders expect (`MORPH/src/utils/dataloaders/` — e.g. `dataloader_be1d.py`, `dataloader_sw2d.py`, CFD3D-turb). Upstream preprocessing notes are in `MORPH/docs`.
+1. **Download** the archives from DARUS (links above). HDF5 layout and shapes are summarized in `specs/plan.md` (e.g. BE1D `tensor`, SW and DR2D groups `0000/data`).
+2. **Preprocess** with `python code/preprocess.py` (`--be1d`, `--sw`, `--dr2d`) or follow `MORPH/scripts/data_normalization_revin.py`; loaders: `dataloader_be1d.py`, `dataloader_sw2d.py`, `dataloader_dr.py` (DR2D). Upstream notes are in `MORPH/docs`.
 3. **Point the sweep** at that tree with `--dataset-root` (defaults to `./MORPH` if data lives inside the clone).
 
 **Trajectory pool:** `TRAJECTORY_POOL` in `code/morph_wrap/sweep_config.py` should match the **number of trajectories in the train split** you actually load (`train_data.shape[0]` in `finetune_MORPH.py`). The sweep sets `--n_traj` to `max(1, int(pool * train_frac / 100))`. If `pool` is too large, `n_traj` can exceed the real train size.
