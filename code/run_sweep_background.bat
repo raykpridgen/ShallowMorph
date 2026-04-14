@@ -13,15 +13,14 @@ set "LOG_FILE=%LOG_DIR%\run_sweep_background.log"
 set "VENV_PY=%REPO_ROOT%\.venv\Scripts\python.exe"
 set "PY_CMD=python"
 if exist "%VENV_PY%" set "PY_CMD=%VENV_PY%"
-
-if /I "%~1"=="--worker" goto worker
+if /I "%RUN_SWEEP_BG_WORKER%"=="1" goto worker
 
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 
 echo Starting background sweep...
 echo Log file: "%LOG_FILE%"
 
-start "MORPH Sweep" /min cmd /c ""%~f0" --worker %*"
+start "MORPH Sweep" /min cmd /v:on /c "set RUN_SWEEP_BG_WORKER=1&& call ""%~f0"" %*"
 
 echo Started. You can lock the computer; process will continue in background.
 echo To monitor:
