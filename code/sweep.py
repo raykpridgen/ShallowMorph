@@ -35,6 +35,9 @@ for the Cartesian product of hyperparameters — order here does not change resu
 - ``batch_size``: ``None`` → same per-dataset defaults as upstream.
 - ``patience``: set very large during sweeps so early stopping does not truncate planned
   epoch counts.
+- **FM weight load:** checkpoints may be saved with a ``module.`` prefix (DataParallel).
+  We always strip that prefix when loading into the unwrapped backbone so base weights match;
+  LoRA ``A``/``B`` tensors still have no FM counterpart and stay randomly initialized (expected).
 """
 
 from __future__ import annotations
@@ -337,16 +340,28 @@ def _strip_module_prefix(state_dict: dict) -> dict:
     return state_dict
 
 
-def _apply_fm_weights(ft_model: nn.Module, fm_state: dict, parallel: str) -> None:
+def _expected_fm_missing_key(k: str) -> bool:
+    """True if this missing key is normal (LoRA adapters not in FM checkpoint)."""
+    return k.endswith((".A", ".B")) or ".lora" in k
+
+
+def _apply_fm_weights(ft_model: nn.Module, fm_state: dict) -> None:
     target = ft_model.module if isinstance(ft_model, nn.DataParallel) else ft_model
     sd = dict(fm_state)
     # Always strip ``module.`` when loading into unwrapped ``target``. FM checkpoints are
     # often saved from DataParallel; keys must match ``target``, not ``DataParallel``.
     sd = _strip_module_prefix(sd)
     inc = target.load_state_dict(sd, strict=False)
-    miss = [k for k in inc.missing_keys if k.endswith((".A", ".B")) or ".lora" in k]
-    if miss:
-        print("→ Missing keys (expected LoRA etc.):", miss[:8], "..." if len(miss) > 8 else "")
+    miss_lora = [k for k in inc.missing_keys if _expected_fm_missing_key(k)]
+    if miss_lora:
+        print("→ Missing keys (expected LoRA etc.):", miss_lora[:8], "..." if len(miss_lora) > 8 else "")
+    miss_other = [k for k in inc.missing_keys if not _expected_fm_missing_key(k)]
+    if miss_other:
+        print(
+            "→ Warning: missing keys (unexpected — check model vs FM hyperparameters):",
+            miss_other[:12],
+            "..." if len(miss_other) > 12 else "",
+        )
     if inc.unexpected_keys:
         print("→ Unexpected keys:", inc.unexpected_keys[:8], "..." if len(inc.unexpected_keys) > 8 else "")
 
@@ -460,7 +475,7 @@ def run_one_finetune(
     if args.ckpt_from != "FM":
         raise NotImplementedError("In-process sweep always resets from FM; use FT only with resume support.")
 
-    _apply_fm_weights(ft_model, fm_state_cpu, args.parallel)
+    _apply_fm_weights(ft_model, fm_state_cpu)
 
     # ``Trainer`` only touches ``model_path`` when ``save_batch_ckpt`` is true (upstream).
     model_path = os.path.join(trainer_stub_dir, "trainer_stub")
