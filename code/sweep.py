@@ -38,6 +38,8 @@ for the Cartesian product of hyperparameters — order here does not change resu
 - **FM weight load:** checkpoints may be saved with a ``module.`` prefix (DataParallel).
   We always strip that prefix when loading into the unwrapped backbone so base weights match;
   LoRA ``A``/``B`` tensors still have no FM counterpart and stay randomly initialized (expected).
+- **Metrics loop:** ``ViT3DRegression`` forward returns a 3-tuple; predictions are the last element
+  (same as ``Trainer`` / ``Visualize3DPredictions``), not the whole return value.
 """
 
 from __future__ import annotations
@@ -345,6 +347,18 @@ def _expected_fm_missing_key(k: str) -> bool:
     return k.endswith((".A", ".B")) or ".lora" in k
 
 
+def _singlestep_prediction(model: nn.Module, inp: torch.Tensor) -> torch.Tensor:
+    """Same contract as ``Trainer.train_singlestep`` / ``validate_singlestep`` / viz: last of 3 outputs."""
+    raw = model(inp)
+    if isinstance(raw, tuple):
+        if len(raw) == 3:
+            return raw[2]
+        raise TypeError(
+            f"Expected a 3-tuple (aux, aux, predictions) from the model; got length {len(raw)}"
+        )
+    return raw
+
+
 def _apply_fm_weights(ft_model: nn.Module, fm_state: dict) -> None:
     target = ft_model.module if isinstance(ft_model, nn.DataParallel) else ft_model
     sd = dict(fm_state)
@@ -598,7 +612,7 @@ def run_one_finetune(
     with torch.no_grad():
         for inp, tar in tqdm(ft_te_loader, desc="test"):
             inp = inp.to(device)
-            out = ft_model(inp)
+            out = _singlestep_prediction(ft_model, inp)
             out_all.append(out.detach().cpu())
             tar_all.append(tar)
     out_all = torch.concat(out_all, dim=0)
