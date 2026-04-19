@@ -332,7 +332,7 @@ def _load_fm_state_dict(savepath_model: str, model_choice: str, ckpt_basename: s
 def _strip_module_prefix(state_dict: dict) -> dict:
     if not state_dict:
         return state_dict
-    if next(iter(state_dict)).startswith("module."):
+    if any(k.startswith("module.") for k in state_dict):
         return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
     return state_dict
 
@@ -340,8 +340,9 @@ def _strip_module_prefix(state_dict: dict) -> dict:
 def _apply_fm_weights(ft_model: nn.Module, fm_state: dict, parallel: str) -> None:
     target = ft_model.module if isinstance(ft_model, nn.DataParallel) else ft_model
     sd = dict(fm_state)
-    if parallel == "no":
-        sd = _strip_module_prefix(sd)
+    # Always strip ``module.`` when loading into unwrapped ``target``. FM checkpoints are
+    # often saved from DataParallel; keys must match ``target``, not ``DataParallel``.
+    sd = _strip_module_prefix(sd)
     inc = target.load_state_dict(sd, strict=False)
     miss = [k for k in inc.missing_keys if k.endswith((".A", ".B")) or ".lora" in k]
     if miss:
