@@ -6,9 +6,11 @@ Layout and I/O follow ``code/computer_setup.md``:
 - Reads data from ``<MORPH>/datasets/normalized_revin/`` and FM weights from
   ``<MORPH>/models/FM/`` (same as ``MORPH/scripts/finetune_MORPH.py`` when that script
   lives under the MORPH clone).
-- Writes this process under ``<repo>/out/sweep_{A|B}_{DATETIME}/``: ``models/`` (recovery
+- Writes this process under ``<repo>/out/sweep_{A|B}/``: ``models/`` (recovery
   + sweep B per-dataset bests), ``results/`` (metrics / plots mirror), ``sweep_metrics.csv``,
-  and ``epoch_metrics.csv``. Stdout is unchanged so the job scheduler can capture it.
+  and ``epoch_metrics.csv``. Re-runs skip any ``run_id`` already in ``sweep_metrics.csv`` and
+  resume incomplete jobs from ``models/recovery_<run_id>.pth`` (same epoch optimizer/model state).
+  Stdout is unchanged so the job scheduler can capture it.
 
 Loop order is optimized to avoid redundant I/O and rebuilds (see ``specs/plan.md``
 for the Cartesian product of hyperparameters — order here does not change results):
@@ -51,7 +53,7 @@ import sys
 import time
 from argparse import Namespace
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 import matplotlib
 
@@ -215,6 +217,71 @@ def _make_run_id(
 ) -> str:
     tf = str(train_frac).replace(".", "p")
     return f"{sweep}_{ft_dataset}_{model_size}_ar{ar_context}_tf{tf}_ntr{n_traj}_ep{n_epochs}"
+
+
+def _resolve_sweep_run_dir(repo_root: str, sweep_letter: str) -> str:
+    """Prefer ``out/sweep_{letter}/``; if missing, use the newest ``out/sweep_{letter}_*/`` (legacy datetime suffix)."""
+    out_dir = os.path.join(repo_root, "out")
+    canonical = os.path.join(out_dir, f"sweep_{sweep_letter}")
+    if os.path.isdir(canonical):
+        return canonical
+    prefix = f"sweep_{sweep_letter}_"
+    try:
+        names = os.listdir(out_dir)
+    except FileNotFoundError:
+        return canonical
+    dated = [
+        os.path.join(out_dir, n)
+        for n in names
+        if n.startswith(prefix) and os.path.isdir(os.path.join(out_dir, n))
+    ]
+    if not dated:
+        return canonical
+    dated.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return dated[0]
+
+
+def _load_completed_run_ids(sweep_metrics_csv: str) -> Set[str]:
+    """``run_id`` values that already have a final row in ``sweep_metrics.csv``."""
+    if not os.path.isfile(sweep_metrics_csv):
+        return set()
+    done: Set[str] = set()
+    with open(sweep_metrics_csv, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames and "run_id" not in reader.fieldnames:
+            return set()
+        for row in reader:
+            rid = row.get("run_id")
+            if rid:
+                done.add(rid)
+    return done
+
+
+def _optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    """Ensure resumed optimizer tensors live on ``device`` (checkpoint often loads on CPU)."""
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device)
+
+
+def _min_val_loss_from_epoch_csv(epoch_metrics_csv: str, run_id: str) -> float | None:
+    """Minimum validation loss logged so far for ``run_id`` (for resume / best_val tracking)."""
+    if not os.path.isfile(epoch_metrics_csv):
+        return None
+    best: float | None = None
+    with open(epoch_metrics_csv, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("run_id") != run_id:
+                continue
+            try:
+                v = float(row["val_loss"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if best is None or v < best:
+                best = v
+    return best
 
 
 # -----------------------------------------------------------------------------
@@ -486,11 +553,6 @@ def run_one_finetune(
         optimizer, mode="min", factor=0.5, patience=5
     )
 
-    if args.ckpt_from != "FM":
-        raise NotImplementedError("In-process sweep always resets from FM; use FT only with resume support.")
-
-    _apply_fm_weights(ft_model, fm_state_cpu)
-
     # ``Trainer`` only touches ``model_path`` when ``save_batch_ckpt`` is true (upstream).
     model_path = os.path.join(trainer_stub_dir, "trainer_stub")
 
@@ -501,6 +563,35 @@ def run_one_finetune(
     ep_st = time.time()
     start_epoch = 0
     run_ok = False
+
+    if os.path.isfile(recovery_path):
+        ckpt_resume = torch.load(recovery_path, map_location="cpu", weights_only=False)
+        if ckpt_resume.get("run_id") != run_id:
+            print(
+                f"→ Warning: recovery run_id mismatch (got {ckpt_resume.get('run_id')!r}, "
+                f"expected {run_id!r}); ignoring checkpoint and starting from FM."
+            )
+            if args.ckpt_from != "FM":
+                raise NotImplementedError(
+                    "In-process sweep always resets from FM; use FT only with resume support."
+                )
+            _apply_fm_weights(ft_model, fm_state_cpu)
+        else:
+            ft_model.load_state_dict(ckpt_resume["model_state_dict"], strict=True)
+            optimizer.load_state_dict(ckpt_resume["optimizer_state_dict"])
+            _optimizer_state_to_device(optimizer, device)
+            start_epoch = int(ckpt_resume["epoch"])
+            prev_best = _min_val_loss_from_epoch_csv(epoch_metrics_csv, run_id)
+            if prev_best is not None:
+                best_val_loss = prev_best
+            print(
+                f"→ Resuming from {recovery_path} at epoch {start_epoch}/{n_epochs} "
+                f"(best val so far {best_val_loss:.6f})"
+            )
+    elif args.ckpt_from != "FM":
+        raise NotImplementedError("In-process sweep always resets from FM; use FT only with resume support.")
+    else:
+        _apply_fm_weights(ft_model, fm_state_cpu)
 
     try:
         for epoch in range(start_epoch, n_epochs):
@@ -755,7 +846,7 @@ def run_one_finetune(
 def main() -> None:
     sweep_conf = SWEEP_A if SWEEP == "A" else SWEEP_B
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(REPO_ROOT, "out", f"sweep_{SWEEP}_{stamp}")
+    run_dir = _resolve_sweep_run_dir(REPO_ROOT, SWEEP)
     os.makedirs(os.path.join(run_dir, "models"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "results"), exist_ok=True)
 
@@ -765,16 +856,19 @@ def main() -> None:
     _ensure_csv_header(epoch_metrics_csv, EPOCH_METRICS_FIELDS)
 
     meta_path = os.path.join(run_dir, "sweep_setup.txt")
-    with open(meta_path, "w", encoding="utf-8") as f:
-        f.write(
-            f"sweep={SWEEP}\n"
-            f"started_utc={stamp}\n"
-            f"REPO_ROOT={REPO_ROOT}\n"
-            f"MORPH_ROOT={MORPH_ROOT}\n"
-            f"DATASET_ROOT_config={repr(DATASET_ROOT)}\n"
-            f"DATASET_ROOT_effective={DATASET_ROOT or MORPH_ROOT}\n"
-            f"fm_models_dir={os.path.join(MORPH_ROOT, 'models', MODEL_CHOICE)}\n"
-        )
+    if not os.path.isfile(meta_path):
+        with open(meta_path, "w", encoding="utf-8") as f:
+            f.write(
+                f"sweep={SWEEP}\n"
+                f"started_utc={stamp}\n"
+                f"REPO_ROOT={REPO_ROOT}\n"
+                f"MORPH_ROOT={MORPH_ROOT}\n"
+                f"DATASET_ROOT_config={repr(DATASET_ROOT)}\n"
+                f"DATASET_ROOT_effective={DATASET_ROOT or MORPH_ROOT}\n"
+                f"fm_models_dir={os.path.join(MORPH_ROOT, 'models', MODEL_CHOICE)}\n"
+            )
+
+    completed_run_ids = _load_completed_run_ids(sweep_metrics_csv)
 
     dataset_root = DATASET_ROOT if DATASET_ROOT is not None else MORPH_ROOT
     datapaths = build_datapaths(dataset_root)
@@ -835,6 +929,9 @@ def main() -> None:
                         run_id = _make_run_id(
                             SWEEP, ft_dataset, model_size, ar_context, train_frac, n_traj, n_epochs
                         )
+                        if run_id in completed_run_ids:
+                            print(f"\n--- Skip completed run_id={run_id} (already in sweep_metrics.csv) ---")
+                            continue
                         print(
                             f"\n--- Run run_id={run_id} | SWEEP={SWEEP} ds={ft_dataset} "
                             f"model={model_size} context={ar_context} train_frac={train_frac} "
@@ -861,6 +958,7 @@ def main() -> None:
                             dataset_best_val=dataset_best_val,
                             save_run_best_weights=save_run_best_weights,
                         )
+                        completed_run_ids.add(run_id)
 
         del train_data, val_data, test_data
 
