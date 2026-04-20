@@ -10,8 +10,9 @@ Layout and I/O follow ``code/computer_setup.md``:
   + sweep B per-dataset bests), ``results/`` (metrics / plots mirror), ``sweep_metrics.csv``,
   and ``epoch_metrics.csv``. Re-runs skip any ``run_id`` already in ``sweep_metrics.csv`` and
   resume incomplete jobs from ``models/recovery_<run_id>.pth`` (same epoch optimizer/model state).
-  Does not replace ``sys.stdout`` / ``sys.stderr``. Progress bars and prints use the
-  process streams so schedulers can capture them (optional line-buffering on stdout only).
+  On startup, stdout/stderr are switched to **line buffering** when attached to a file
+  (typical scheduler redirects) so ``tail -f`` on the job log updates promptly. Interactive
+  terminals are unchanged.
 
 Loop order is optimized to avoid redundant I/O and rebuilds (see ``specs/plan.md``
 for the Cartesian product of hyperparameters — order here does not change results):
@@ -48,6 +49,7 @@ for the Cartesian product of hyperparameters — order here does not change resu
 from __future__ import annotations
 
 import csv
+import io
 import os
 import shutil
 import sys
@@ -852,6 +854,42 @@ def run_one_finetune(
         torch.cuda.empty_cache()
 
 
+def _prepare_stdio_for_batch_logs() -> None:
+    """Line-buffer stdout/stderr when redirected to files so batch logs update live (``tail -f``)."""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        try:
+            stream.flush()
+        except Exception:
+            pass
+        try:
+            recon = getattr(stream, "reconfigure", None)
+            if callable(recon):
+                recon(line_buffering=True)
+                continue
+        except (OSError, io.UnsupportedOperation):
+            pass
+        buf = getattr(stream, "buffer", None)
+        if buf is None:
+            continue
+        enc = getattr(stream, "encoding", None) or "utf-8"
+        errors = getattr(stream, "errors", None) or "replace"
+        try:
+            setattr(
+                sys,
+                name,
+                io.TextIOWrapper(
+                    buf,
+                    encoding=enc,
+                    errors=errors,
+                    line_buffering=True,
+                    write_through=True,
+                ),
+            )
+        except Exception:
+            pass
+
+
 def _configure_training_device() -> tuple[torch.device, int]:
     """Pick ``torch.device`` using the same rules as ``morph_wrap.run_sweep`` / ``finetune_MORPH``."""
     resolved_idx, dev_info = resolve_training_device_index(DEVICE_IDX)
@@ -885,13 +923,6 @@ def _configure_training_device() -> tuple[torch.device, int]:
 
 
 def main() -> None:
-    try:
-        reconf = getattr(sys.stdout, "reconfigure", None)
-        if callable(reconf):
-            reconf(line_buffering=True)
-    except OSError:
-        pass
-
     sweep_conf = SWEEP_A if SWEEP == "A" else SWEEP_B
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = _resolve_sweep_run_dir(REPO_ROOT, SWEEP)
@@ -1019,4 +1050,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    _prepare_stdio_for_batch_logs()
     main()
