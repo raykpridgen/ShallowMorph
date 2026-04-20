@@ -10,7 +10,8 @@ Layout and I/O follow ``code/computer_setup.md``:
   + sweep B per-dataset bests), ``results/`` (metrics / plots mirror), ``sweep_metrics.csv``,
   and ``epoch_metrics.csv``. Re-runs skip any ``run_id`` already in ``sweep_metrics.csv`` and
   resume incomplete jobs from ``models/recovery_<run_id>.pth`` (same epoch optimizer/model state).
-  Stdout is unchanged so the job scheduler can capture it.
+  Does not replace ``sys.stdout`` / ``sys.stderr``. Progress bars and prints use the
+  process streams so schedulers can capture them (optional line-buffering on stdout only).
 
 Loop order is optimized to avoid redundant I/O and rebuilds (see ``specs/plan.md``
 for the Cartesian product of hyperparameters — order here does not change results):
@@ -80,7 +81,6 @@ sys.path.insert(0, MORPH_ROOT)
 from config.data_config import DataConfig  # noqa: E402
 from src.utils.data_preparation_fast import FastARDataPreparer  # noqa: E402
 from src.utils.dataloaders.dataloaderchaos import DataloaderChaos  # noqa: E402
-from src.utils.device_manager import DeviceManager  # noqa: E402
 from src.utils.metrics_3d import Metrics3DCalculator  # noqa: E402
 from src.utils.normalization import RevIN  # noqa: E402
 from src.utils.select_fine_tuning_parameters import SelectFineTuningParameters  # noqa: E402
@@ -89,11 +89,16 @@ from src.utils.visualize_predictions_3d_full import Visualize3DPredictions  # no
 from src.utils.visualize_rollouts_3d_full import Visualize3DRolloutPredictions  # noqa: E402
 from src.utils.vit_conv_xatt_axialatt2 import ViT3DRegression  # noqa: E402
 
+sys.path.insert(0, _CODE_DIR)
+from morph_wrap.device_resolve import (  # noqa: E402
+    format_device_resolution_log,
+    resolve_training_device_index,
+)
+
 # Optional: reuse trajectory caps from the subprocess driver (same semantics as README).
 try:
-    sys.path.insert(0, _CODE_DIR)
     from morph_wrap.sweep_config import TRAJECTORY_POOL  # type: ignore
-except Exception:  # morph_wrap not on path or import error
+except Exception:  # import error
     TRAJECTORY_POOL = None
 
 # -----------------------------------------------------------------------------
@@ -108,7 +113,10 @@ DATASET_ROOT: str | None = None
 
 MODEL_CHOICE = "FM"
 PARALLEL = "dp"
-DEVICE_IDX = 0
+# Logical CUDA index among *visible* devices (after PBS/Slurm sets ``CUDA_VISIBLE_DEVICES``).
+# Use ``None`` for the same auto rule as ``morph_wrap.run_sweep --device-index auto``
+# (``MORPH_DEVICE_IDX`` if set, else ``torch.cuda.current_device()``).
+DEVICE_IDX: int | None = 0
 
 # Study datasets (MORPH ``ft_dataset`` names)
 FT_DATASETS: List[str] = ["BE1D", "SW", "DR2D"]
@@ -289,12 +297,12 @@ def _min_val_loss_from_epoch_csv(epoch_metrics_csv: str, run_id: str) -> float |
 # -----------------------------------------------------------------------------
 
 
-def base_train_args() -> Namespace:
+def base_train_args(device_idx: int) -> Namespace:
     """Static hyperparameters and flags; swept fields are overwritten per run."""
     return Namespace(
         model_choice=MODEL_CHOICE,
         parallel=PARALLEL,
-        device_idx=DEVICE_IDX,
+        device_idx=device_idx,
         ckpt_from="FM",
         # LoRA / transformer defaults (match morph_cli / upstream argparse)
         rank_lora_attn=16,
@@ -701,7 +709,8 @@ def run_one_finetune(
     ft_model.eval()
     out_all, tar_all = [], []
     with torch.no_grad():
-        for inp, tar in tqdm(ft_te_loader, desc="test"):
+        # tqdm defaults to stderr; batch ``-o`` often captures stdout only — use stdout like ``print``.
+        for inp, tar in tqdm(ft_te_loader, desc="test", file=sys.stdout):
             inp = inp.to(device)
             out = _singlestep_prediction(ft_model, inp)
             out_all.append(out.detach().cpu())
@@ -843,7 +852,46 @@ def run_one_finetune(
         torch.cuda.empty_cache()
 
 
+def _configure_training_device() -> tuple[torch.device, int]:
+    """Pick ``torch.device`` using the same rules as ``morph_wrap.run_sweep`` / ``finetune_MORPH``."""
+    resolved_idx, dev_info = resolve_training_device_index(DEVICE_IDX)
+    explicit = DEVICE_IDX is not None
+    print(
+        format_device_resolution_log(resolved_idx, dev_info, explicit_cli=explicit),
+        file=sys.stderr,
+    )
+    cuda_ok = torch.cuda.is_available() and torch.cuda.device_count() > 0
+    if cuda_ok:
+        n = torch.cuda.device_count()
+        if resolved_idx < 0 or resolved_idx >= n:
+            resolved_idx = 0
+            print(
+                f"morph_wrap: clamped device index to 0 (visible device_count={n})",
+                file=sys.stderr,
+            )
+        torch.cuda.set_device(resolved_idx)
+        dev = torch.device(f"cuda:{resolved_idx}")
+        print(
+            f"morph_wrap: using {dev} ({torch.cuda.get_device_name(resolved_idx)})",
+            file=sys.stderr,
+        )
+        return dev, resolved_idx
+
+    print(
+        "morph_wrap: CUDA unavailable or no devices — training on CPU",
+        file=sys.stderr,
+    )
+    return torch.device("cpu"), resolved_idx
+
+
 def main() -> None:
+    try:
+        reconf = getattr(sys.stdout, "reconfigure", None)
+        if callable(reconf):
+            reconf(line_buffering=True)
+    except OSError:
+        pass
+
     sweep_conf = SWEEP_A if SWEEP == "A" else SWEEP_B
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = _resolve_sweep_run_dir(REPO_ROOT, SWEEP)
@@ -873,8 +921,15 @@ def main() -> None:
     dataset_root = DATASET_ROOT if DATASET_ROOT is not None else MORPH_ROOT
     datapaths = build_datapaths(dataset_root)
 
-    devices = DeviceManager.list_devices()
-    device = devices[DEVICE_IDX] if devices else torch.device("cpu")
+    device, resolved_device_idx = _configure_training_device()
+    if device.type == "cuda":
+        print(
+            f"→ Training device: cuda:{resolved_device_idx} "
+            f"({torch.cuda.get_device_name(resolved_device_idx)})",
+            flush=True,
+        )
+    else:
+        print("→ Training device: cpu", flush=True)
 
     fm_models_root = os.path.join(MORPH_ROOT, "models")
     savepath_results = os.path.join(run_dir, "results")
@@ -911,7 +966,7 @@ def main() -> None:
             )
 
             for ar_context in contexts:
-                args = base_train_args()
+                args = base_train_args(resolved_device_idx)
                 args.model_size = model_size
                 args.ar_order = ar_context
                 args.max_ar_order = ar_context
