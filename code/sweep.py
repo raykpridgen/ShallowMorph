@@ -6,8 +6,8 @@ Layout and I/O follow ``code/computer_setup.md``:
 - Reads data from ``<MORPH>/datasets/normalized_revin/`` and FM weights from
   ``<MORPH>/models/FM/`` (same as ``MORPH/scripts/finetune_MORPH.py`` when that script
   lives under the MORPH clone).
-- Writes this process under ``<repo>/out/sweep_{A|B}/``: ``models/`` (recovery
-  + sweep B per-dataset bests), ``results/`` (metrics / plots mirror), ``sweep_metrics.csv``,
+- Writes this process under ``<repo>/out/<SWEEP_OUTPUT_DIR>/``: ``models/`` (recovery),
+  ``results/`` (metrics / plots mirror), ``sweep_metrics.csv``,
   and ``epoch_metrics.csv``. Re-runs skip any ``run_id`` already in ``sweep_metrics.csv`` and
   resume incomplete jobs from ``models/recovery_<run_id>.pth`` (same epoch optimizer/model state).
   On startup, stdout/stderr are switched to **line buffering** when attached to a file
@@ -30,10 +30,8 @@ for the Cartesian product of hyperparameters — order here does not change resu
   is the **basename** under ``<MORPH>/models/<model_choice>/`` (same contract as
   ``morph_wrap.morph_cli.finetune_argv``). Use ``ckpt_from='FT'`` only if you add resume
   logic later.
-- Checkpoints: Sweep A writes only a per-run **recovery** checkpoint (overwritten each
-  epoch, removed after a successful run). Sweep B additionally keeps ``best_ft_<DATASET>.pth``
-  under the run's ``models/`` when validation improves the best seen for that dataset
-  across the whole sweep; no writes to ``MORPH/models/<ft_dataset>/``.
+- Checkpoints: writes only a per-run **recovery** checkpoint (overwritten each
+  epoch, removed after a successful run).
 - ``ar_order`` vs ``rollout_horizon``: training context is ``ar_order`` / ``max_ar_order``
   (kept equal). ``rollout_horizon`` only affects visualization length (default 50 here).
 - ``batch_size``: ``None`` → same per-dataset defaults as upstream.
@@ -55,7 +53,6 @@ import shutil
 import sys
 import time
 from argparse import Namespace
-from datetime import datetime
 from typing import Any, Dict, List, Set
 
 import matplotlib
@@ -104,10 +101,12 @@ except Exception:  # import error
     TRAJECTORY_POOL = None
 
 # -----------------------------------------------------------------------------
-# Sweep selection and grids (edit here)
+# Sweep configuration (edit here)
 # -----------------------------------------------------------------------------
 
-SWEEP = "A"  # "A" or "B"
+# Name of output directory under ``out/``.
+# Examples: ``sweep_A_1``, ``sweep_A_2``, ``be1d_sweep_A``.
+SWEEP_OUTPUT_DIR = "sweep_A"
 
 # If None, raw HDF5 lives under ``<MORPH_ROOT>/datasets/normalized_revin/...`` (upstream).
 # Set to an explicit root only when your tree matches finetune's join layout.
@@ -124,23 +123,10 @@ DEVICE_IDX: int | None = 0
 FT_DATASETS: List[str] = ["BE1D", "SW", "DR2D"]
 
 SWEEP_A = {
-    "train_size": [0.1, 0.5],  # fraction of train-split trajectories (or percent if > 1)
-    "epoch_size": [10, 50],
-    "model_type": ["Ti", "S"],
-    "ar_context": [1, 5, 10],
-}
-
-SWEEP_B = {
-    "train_size": [0.1, 0.25, 0.5, 1.0],
+    "train_size": [0.1, 0.25, 0.5, 1.0],  # fraction of train-split trajectories (or percent if > 1)
     "epoch_size": [10, 50, 100, 200],
-    "model_type": ["Ti", "S", "L"],
-}
-
-# After sweep A: fill from ``morph_wrap.pick_context`` JSON or by hand.
-SWEEP_B_CONTEXTS: Dict[str, int] = {
-    "BE1D": 1,
-    "SW": 5,
-    "DR2D": 10,
+    "model_type": ["Ti", "S"],
+    "ar_context": [1],
 }
 
 FM_CHECKPOINT_BASENAME: Dict[str, str] = {
@@ -242,28 +228,6 @@ def _make_combo_id(
     return (
         f"{sweep}_{ft_dataset}_{model_size}_ar{ar_context}_tf{tf}_ntr{n_traj}_epmax{max_epochs}"
     )
-
-
-def _resolve_sweep_run_dir(repo_root: str, sweep_letter: str) -> str:
-    """Prefer ``out/sweep_{letter}/``; if missing, use the newest ``out/sweep_{letter}_*/`` (legacy datetime suffix)."""
-    out_dir = os.path.join(repo_root, "out")
-    canonical = os.path.join(out_dir, f"sweep_{sweep_letter}")
-    if os.path.isdir(canonical):
-        return canonical
-    prefix = f"sweep_{sweep_letter}_"
-    try:
-        names = os.listdir(out_dir)
-    except FileNotFoundError:
-        return canonical
-    dated = [
-        os.path.join(out_dir, n)
-        for n in names
-        if n.startswith(prefix) and os.path.isdir(os.path.join(out_dir, n))
-    ]
-    if not dated:
-        return canonical
-    dated.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return dated[0]
 
 
 def _load_completed_run_ids(sweep_metrics_csv: str) -> Set[str]:
@@ -1022,9 +986,9 @@ def _configure_training_device() -> tuple[torch.device, int]:
 
 
 def main() -> None:
-    sweep_conf = SWEEP_A if SWEEP == "A" else SWEEP_B
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = _resolve_sweep_run_dir(REPO_ROOT, SWEEP)
+    sweep_key = "A"
+    sweep_conf = SWEEP_A
+    run_dir = os.path.join(REPO_ROOT, "out", SWEEP_OUTPUT_DIR)
     os.makedirs(os.path.join(run_dir, "models"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "results"), exist_ok=True)
 
@@ -1037,8 +1001,8 @@ def main() -> None:
     if not os.path.isfile(meta_path):
         with open(meta_path, "w", encoding="utf-8") as f:
             f.write(
-                f"sweep={SWEEP}\n"
-                f"started_utc={stamp}\n"
+                f"sweep={sweep_key}\n"
+                f"sweep_output_dir={SWEEP_OUTPUT_DIR}\n"
                 f"REPO_ROOT={REPO_ROOT}\n"
                 f"MORPH_ROOT={MORPH_ROOT}\n"
                 f"DATASET_ROOT_config={repr(DATASET_ROOT)}\n"
@@ -1068,7 +1032,7 @@ def main() -> None:
     data_module = DataloaderChaos()
     fm_cache: Dict[str, dict] = {}
     dataset_best_val: Dict[str, float] = {ds: float("inf") for ds in FT_DATASETS}
-    save_run_best_weights = SWEEP == "B"
+    save_run_best_weights = False
 
     print(f"→ Sweep output directory: {run_dir}")
     print(f"→ Loading FM checkpoints from {os.path.join(fm_models_root, MODEL_CHOICE)}")
@@ -1091,9 +1055,7 @@ def main() -> None:
                 fm_cache[model_size] = _load_fm_state_dict(fm_models_root, MODEL_CHOICE, ckpt_file)
             fm_state = fm_cache[model_size]
 
-            contexts = (
-                sweep_conf["ar_context"] if SWEEP == "A" else [SWEEP_B_CONTEXTS[ft_dataset]]
-            )
+            contexts = sweep_conf["ar_context"]
 
             for ar_context in contexts:
                 args = base_train_args(resolved_device_idx)
@@ -1101,18 +1063,16 @@ def main() -> None:
                 args.ar_order = ar_context
                 args.max_ar_order = ar_context
                 args.patience = 10**6
-                if SWEEP == "A":
-                    args.save_every = 10**9
-                    args.overwrite_weights = False
-                else:
-                    args.save_every = 1
-                    args.overwrite_weights = True
+                args.save_every = 10**9
+                args.overwrite_weights = False
 
                 for train_frac in sweep_conf["train_size"]:
                     n_traj = resolve_n_traj(ft_dataset, train_frac, train_data.shape[0])
                     epoch_targets = sorted({int(ep) for ep in sweep_conf["epoch_size"]})
                     run_ids = [
-                        _make_run_id(SWEEP, ft_dataset, model_size, ar_context, train_frac, n_traj, ep)
+                        _make_run_id(
+                            sweep_key, ft_dataset, model_size, ar_context, train_frac, n_traj, ep
+                        )
                         for ep in epoch_targets
                     ]
                     pending_targets = [
@@ -1120,14 +1080,14 @@ def main() -> None:
                     ]
                     if not pending_targets:
                         print(
-                            f"\n--- Skip completed combo SWEEP={SWEEP} ds={ft_dataset} "
+                            f"\n--- Skip completed combo SWEEP={sweep_key} ds={ft_dataset} "
                             f"model={model_size} context={ar_context} train_frac={train_frac} "
                             f"n_traj={n_traj} targets={epoch_targets} ---"
                         )
                         continue
 
                     combo_id = _make_combo_id(
-                        SWEEP,
+                        sweep_key,
                         ft_dataset,
                         model_size,
                         ar_context,
@@ -1136,15 +1096,15 @@ def main() -> None:
                         max(epoch_targets),
                     )
                     print(
-                        f"\n--- Run combo_id={combo_id} | SWEEP={SWEEP} ds={ft_dataset} "
-                        f"model={model_size} context={ar_context} train_frac={train_frac} "
-                        f"n_traj={n_traj} targets={epoch_targets} pending={pending_targets} ---"
-                    )
+                        f"\n--- Run combo_id={combo_id} | SWEEP={sweep_key} ds={ft_dataset} "
+                            f"model={model_size} context={ar_context} train_frac={train_frac} "
+                            f"n_traj={n_traj} targets={epoch_targets} pending={pending_targets} ---"
+                        )
                     run_one_finetune(
                         args=args,
                         combo_id=combo_id,
                         run_dir=run_dir,
-                        sweep_key=SWEEP,
+                        sweep_key=sweep_key,
                         ft_dataset=ft_dataset,
                         train_frac=train_frac,
                         train_data=train_data,
