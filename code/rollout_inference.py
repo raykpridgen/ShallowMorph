@@ -615,7 +615,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample_idx", type=int, default=0, help="Test trajectory index.")
     p.add_argument("--model_size", choices=list(MORPH_MODELS.keys()), default="Ti")
     p.add_argument("--model_choice", default="FM", help="FM or standalone model choice semantics from MORPH.")
-    p.add_argument("--ar_context", type=int, default=1, help="Autoregressive context frames.")
+    p.add_argument("--ar_context", type=int, default=2, help="Autoregressive context frames.")
     p.add_argument("--device", default="auto", help="auto | cpu | cuda | cuda:0 ...")
     p.add_argument("--output_dir", default=str(REPO_ROOT / "out" / "results" / "rollouts"))
     p.add_argument("--gif_fps", type=int, default=6)

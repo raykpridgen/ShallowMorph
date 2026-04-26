@@ -126,7 +126,7 @@ SWEEP_A = {
     "train_size": [0.1, 0.25, 0.5, 1.0],  # fraction of train-split trajectories (or percent if > 1)
     "epoch_size": [10, 50, 100, 200],
     "model_type": ["Ti", "S"],
-    "ar_context": [1],
+    "ar_context": [2],
 }
 
 FM_CHECKPOINT_BASENAME: Dict[str, str] = {
@@ -286,9 +286,9 @@ def base_train_args(device_idx: int) -> Namespace:
         device_idx=device_idx,
         ckpt_from="FM",
         # LoRA / transformer defaults (match morph_cli / upstream argparse)
-        rank_lora_attn=16,
-        rank_lora_mlp=12,
-        lora_p=0.05,
+        rank_lora_attn=0,
+        rank_lora_mlp=0,
+        lora_p=0.0,
         tf_reg=[0.1, 0.1],
         heads_xa=32,
         test_sample=0,
@@ -298,11 +298,11 @@ def base_train_args(device_idx: int) -> Namespace:
         wd_level4=0.0,
         save_batch_ckpt=False,
         save_batch_freq=1000,
-        # Level 3 == LoRA + encoder + decoder (requires all three flags in upstream script)
-        ft_level1=True,
-        ft_level2=True,
-        ft_level3=True,
-        ft_level4=False,
+        # Full-model fine-tuning: train all parameters.
+        ft_level1=False,
+        ft_level2=False,
+        ft_level3=False,
+        ft_level4=True,
     )
 
 
