@@ -279,7 +279,28 @@ def build_gif(frames: List[Path], out_gif: Path, fps: int) -> None:
     if not frames:
         return
     imgs = [imageio.imread(p) for p in frames]
-    imageio.mimsave(out_gif, imgs, fps=fps)
+    # Matplotlib-exported PNGs can differ by a few pixels across timesteps
+    # (e.g., colorbar tick label width). GIF encoders require identical shape.
+    max_h = max(img.shape[0] for img in imgs)
+    max_w = max(img.shape[1] for img in imgs)
+    norm = []
+    for img in imgs:
+        h, w = img.shape[0], img.shape[1]
+        if h == max_h and w == max_w:
+            norm.append(img)
+            continue
+        pad_h = max_h - h
+        pad_w = max_w - w
+        top = pad_h // 2
+        bottom = pad_h - top
+        left = pad_w // 2
+        right = pad_w - left
+        if img.ndim == 2:
+            padded = np.pad(img, ((top, bottom), (left, right)), mode="edge")
+        else:
+            padded = np.pad(img, ((top, bottom), (left, right), (0, 0)), mode="edge")
+        norm.append(padded)
+    imageio.mimsave(out_gif, norm, fps=fps)
 
 
 def evenly_spaced_indices(total: int, want: int) -> List[int]:
