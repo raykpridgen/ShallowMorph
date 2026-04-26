@@ -192,19 +192,19 @@ def extract_pred(raw):
     return raw
 
 
-def tensor_to_2d(field_tensor: torch.Tensor) -> np.ndarray:
+def tensor_to_plot_array(field_tensor: torch.Tensor) -> np.ndarray:
     """
-    field_tensor expected around (C,D,H,W) / (C,H,W) / (H,W), return (H,W).
+    Convert model field tensor to a plottable array (1D or 2D).
+    Handles shapes like (C,D,H,W), (C,H,W), (H,W), (W).
     """
     x = field_tensor.detach().cpu()
     while x.ndim > 2 and 1 in x.shape:
         x = x.squeeze()
-    if x.ndim == 4:  # C,D,H,W
-        x = x[0, x.shape[1] // 2]
-    elif x.ndim == 3:  # C,H,W or D,H,W
-        x = x[0] if x.shape[0] <= 8 else x[x.shape[0] // 2]
     while x.ndim > 2:
-        x = x[x.shape[0] // 2]
+        idx = 0 if x.shape[0] <= 8 else x.shape[0] // 2
+        x = x[idx]
+    if x.ndim == 0:
+        x = x.unsqueeze(0)
     return x.numpy()
 
 
@@ -214,8 +214,15 @@ def safe_ssim(a: np.ndarray, b: np.ndarray) -> float:
     data_range = float(max(a.max(), b.max()) - min(a.min(), b.min()))
     if data_range <= 0:
         data_range = 1.0
+    kwargs = {"data_range": data_range}
+    # For small spatial dimensions, skimage default win_size may be too large.
+    min_dim = min(a.shape) if a.ndim > 1 else a.shape[0]
+    if min_dim < 7:
+        win = min_dim if min_dim % 2 == 1 else min_dim - 1
+        if win >= 3:
+            kwargs["win_size"] = win
     try:
-        return float(skimage_ssim(a, b, data_range=data_range))
+        return float(skimage_ssim(a, b, **kwargs))
     except Exception:
         return float("nan")
 
@@ -235,28 +242,60 @@ def make_dirs(root: Path) -> Dict[str, Path]:
     return out
 
 
-def save_triptych(true_2d: np.ndarray, pred_2d: np.ndarray, out_path: Path, title: str) -> None:
-    diff_2d = np.abs(true_2d - pred_2d)
-    vmin = float(min(true_2d.min(), pred_2d.min()))
-    vmax = float(max(true_2d.max(), pred_2d.max()))
+def align_plot_arrays(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Crop/align 1D or 2D arrays to a shared shape."""
+    if a.ndim == b.ndim == 1:
+        n = min(a.shape[0], b.shape[0])
+        return a[:n], b[:n]
+    if a.ndim == b.ndim == 2:
+        h = min(a.shape[0], b.shape[0])
+        w = min(a.shape[1], b.shape[1])
+        return a[:h, :w], b[:h, :w]
+    # Fallback: flatten and align by shortest length
+    af = a.reshape(-1)
+    bf = b.reshape(-1)
+    n = min(af.shape[0], bf.shape[0])
+    return af[:n], bf[:n]
+
+
+def save_triptych(true_arr: np.ndarray, pred_arr: np.ndarray, out_path: Path, title: str) -> None:
+    diff_arr = np.abs(true_arr - pred_arr)
+    vmin = float(min(true_arr.min(), pred_arr.min()))
+    vmax = float(max(true_arr.max(), pred_arr.max()))
     if vmax <= vmin:
         vmax = vmin + 1e-8
 
     fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
-    im0 = axes[0].imshow(true_2d, cmap="viridis", vmin=vmin, vmax=vmax)
-    axes[0].set_title("Actual")
-    axes[0].axis("off")
-    plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+    if true_arr.ndim == 1:
+        x = np.arange(true_arr.shape[0])
+        axes[0].plot(x, true_arr)
+        axes[0].set_title("Actual")
+        axes[0].set_ylim(vmin, vmax)
+        axes[0].grid(alpha=0.25)
 
-    im1 = axes[1].imshow(pred_2d, cmap="viridis", vmin=vmin, vmax=vmax)
-    axes[1].set_title("Predicted")
-    axes[1].axis("off")
-    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+        axes[1].plot(x, pred_arr)
+        axes[1].set_title("Predicted")
+        axes[1].set_ylim(vmin, vmax)
+        axes[1].grid(alpha=0.25)
 
-    im2 = axes[2].imshow(diff_2d, cmap="hot")
-    axes[2].set_title("Absolute Diff")
-    axes[2].axis("off")
-    plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+        axes[2].plot(x, diff_arr, color="tab:red")
+        axes[2].set_title("Absolute Diff")
+        axes[2].grid(alpha=0.25)
+    else:
+        im0 = axes[0].imshow(true_arr, cmap="viridis", vmin=vmin, vmax=vmax)
+        axes[0].set_title("Actual")
+        axes[0].axis("off")
+        plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+        im1 = axes[1].imshow(pred_arr, cmap="viridis", vmin=vmin, vmax=vmax)
+        axes[1].set_title("Predicted")
+        axes[1].axis("off")
+        plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+        im2 = axes[2].imshow(diff_arr, cmap="hot")
+        axes[2].set_title("Absolute Diff")
+        axes[2].axis("off")
+        plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
 
     fig.suptitle(title)
     fig.tight_layout()
@@ -266,10 +305,15 @@ def save_triptych(true_2d: np.ndarray, pred_2d: np.ndarray, out_path: Path, titl
 
 def save_single(img: np.ndarray, out_path: Path, title: str, cmap: str = "viridis") -> None:
     fig, ax = plt.subplots(figsize=(4.8, 4.8))
-    im = ax.imshow(img, cmap=cmap)
-    ax.set_title(title)
-    ax.axis("off")
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    if img.ndim == 1:
+        ax.plot(np.arange(img.shape[0]), img, color="tab:blue")
+        ax.set_title(title)
+        ax.grid(alpha=0.25)
+    else:
+        im = ax.imshow(img, cmap=cmap)
+        ax.set_title(title)
+        ax.axis("off")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
@@ -333,16 +377,28 @@ def save_overview_grid(
     for col, t in enumerate(chosen_idx):
         t_img = true_by_step[t]
         p_img = pred_by_step[t]
+        t_img, p_img = align_plot_arrays(t_img, p_img)
         vmin = float(min(t_img.min(), p_img.min()))
         vmax = float(max(t_img.max(), p_img.max()))
         if vmax <= vmin:
             vmax = vmin + 1e-8
-        axes[0, col].imshow(t_img, cmap="viridis", vmin=vmin, vmax=vmax)
-        axes[0, col].set_title(f"Actual t={t+1}")
-        axes[0, col].axis("off")
-        axes[1, col].imshow(p_img, cmap="viridis", vmin=vmin, vmax=vmax)
-        axes[1, col].set_title(f"Pred t={t+1}")
-        axes[1, col].axis("off")
+        if t_img.ndim == 1:
+            x = np.arange(t_img.shape[0])
+            axes[0, col].plot(x, t_img)
+            axes[0, col].set_ylim(vmin, vmax)
+            axes[0, col].set_title(f"Actual t={t+1}")
+            axes[0, col].grid(alpha=0.25)
+            axes[1, col].plot(x, p_img)
+            axes[1, col].set_ylim(vmin, vmax)
+            axes[1, col].set_title(f"Pred t={t+1}")
+            axes[1, col].grid(alpha=0.25)
+        else:
+            axes[0, col].imshow(t_img, cmap="viridis", vmin=vmin, vmax=vmax)
+            axes[0, col].set_title(f"Actual t={t+1}")
+            axes[0, col].axis("off")
+            axes[1, col].imshow(p_img, cmap="viridis", vmin=vmin, vmax=vmax)
+            axes[1, col].set_title(f"Pred t={t+1}")
+            axes[1, col].axis("off")
     fig.suptitle(f"Field {field_id} Overview (Actual over Predicted)")
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
@@ -424,13 +480,9 @@ def rollout(cfg: EvalConfig, model: torch.nn.Module, sample: np.ndarray, out_dir
             step_mse_vals = []
             step_ssim_vals = []
             for f in range(num_fields):
-                t2 = tensor_to_2d(true_cpu[f])
-                p2 = tensor_to_2d(pred_cpu[f])
-                if t2.shape != p2.shape:
-                    h = min(t2.shape[0], p2.shape[0])
-                    w = min(t2.shape[1], p2.shape[1])
-                    t2 = t2[:h, :w]
-                    p2 = p2[:h, :w]
+                t2 = tensor_to_plot_array(true_cpu[f])
+                p2 = tensor_to_plot_array(pred_cpu[f])
+                t2, p2 = align_plot_arrays(t2, p2)
                 d2 = np.abs(t2 - p2)
 
                 mse_val = float(np.mean((t2 - p2) ** 2))
