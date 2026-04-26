@@ -483,8 +483,12 @@ def main():
     }
     
     test_data = data_module.load_data(args.dataset, datapaths[args.dataset], split='test')
-    print(f"Test data shape: {test_data.shape}")
-    
+    try:
+        print(f"Test data shape: {test_data.shape}")
+    except Exception as e:
+        print(f"Error: {args.dataset} path could not be found at {datapaths[args.dataset]}\n")
+        return
+
     # Load model
     print(f"Loading model from {model_path}...")
     model = load_model_from_checkpoint(
