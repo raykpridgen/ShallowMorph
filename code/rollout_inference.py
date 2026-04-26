@@ -133,11 +133,28 @@ def create_comparison_frame(pred_slice: np.ndarray, true_slice: np.ndarray,
                           timestep: int, field_name: str = "Field", 
                           colormap: str = 'viridis') -> np.ndarray:
     """Create side-by-side comparison frame with difference."""
+    # Ensure we have proper 2D arrays
+    if len(pred_slice.shape) != 2 or len(true_slice.shape) != 2:
+        raise ValueError(f"Expected 2D arrays, got pred: {pred_slice.shape}, true: {true_slice.shape}")
+    
+    # Ensure arrays have the same shape
+    if pred_slice.shape != true_slice.shape:
+        print(f"Warning: Shape mismatch - pred: {pred_slice.shape}, true: {true_slice.shape}")
+        # Resize to match the smaller dimension
+        min_h = min(pred_slice.shape[0], true_slice.shape[0])
+        min_w = min(pred_slice.shape[1], true_slice.shape[1])
+        pred_slice = pred_slice[:min_h, :min_w]
+        true_slice = true_slice[:min_h, :min_w]
+    
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     
     # Calculate shared color range
     vmin = min(pred_slice.min(), true_slice.min())
     vmax = max(pred_slice.max(), true_slice.max())
+    
+    # Handle case where vmin == vmax (constant values)
+    if vmin == vmax:
+        vmax = vmin + 1e-8
     
     # True
     im1 = axes[0].imshow(true_slice, cmap=colormap, vmin=vmin, vmax=vmax)
@@ -178,11 +195,16 @@ def perform_extended_rollout(model: nn.Module, test_data: np.ndarray, device: to
     sample = test_data[sample_idx]  # Shape: (T, D, H, W, C, F)
     T, D, H, W, C, F = sample.shape
     
+    print(f"Input sample shape: {sample.shape}")
+    print(f"T={T}, D={D}, H={H}, W={W}, C={C}, F={F}")
+    
     # Convert to model input format: (T, F, C, D, H, W)
     sample_tensor = torch.from_numpy(sample.transpose(0, 5, 4, 1, 2, 3)).float()
+    print(f"Converted tensor shape: {sample_tensor.shape}")
     
     # Initialize with ar_order frames
     current_context = sample_tensor[:ar_order].unsqueeze(0).to(device)  # (1, ar_order, F, C, D, H, W)
+    print(f"Initial context shape: {current_context.shape}")
     
     predictions = []
     ground_truths = []
@@ -205,6 +227,9 @@ def perform_extended_rollout(model: nn.Module, test_data: np.ndarray, device: to
                 else:
                     pred = model_output
                 
+                if step == 0:  # Debug first prediction
+                    print(f"First prediction shape: {pred.shape}")
+                
                 predictions.append(pred.cpu())
                 
                 # Get ground truth if available
@@ -213,6 +238,7 @@ def perform_extended_rollout(model: nn.Module, test_data: np.ndarray, device: to
                     ground_truths.append(gt)
                 else:
                     # No more ground truth available
+                    print(f"No more ground truth after step {step}")
                     break
                 
                 # Update context for next step (sliding window)
@@ -227,11 +253,19 @@ def perform_extended_rollout(model: nn.Module, test_data: np.ndarray, device: to
                     
             except Exception as e:
                 print(f"Error at step {step}: {e}")
+                import traceback
+                traceback.print_exc()
                 break
     
+    final_preds = torch.cat(predictions, dim=0) if predictions else torch.empty(0)
+    final_truths = torch.cat(ground_truths, dim=0) if ground_truths else torch.empty(0)
+    
+    print(f"Final predictions shape: {final_preds.shape}")
+    print(f"Final ground truths shape: {final_truths.shape}")
+    
     return {
-        'predictions': torch.cat(predictions, dim=0) if predictions else torch.empty(0),
-        'ground_truths': torch.cat(ground_truths, dim=0) if ground_truths else torch.empty(0),
+        'predictions': final_preds,
+        'ground_truths': final_truths,
         'num_steps': len(predictions)
     }
 
@@ -248,6 +282,34 @@ def calculate_metrics_per_timestep(predictions: torch.Tensor, ground_truths: tor
     }
     
     print("Calculating metrics per timestep...")
+    
+    def extract_2d_for_ssim(tensor):
+        """Extract a 2D tensor suitable for SSIM calculation."""
+        # Remove singleton dimensions and convert to CPU
+        arr = tensor.detach().cpu()
+        
+        # Squeeze singleton dimensions
+        while len(arr.shape) > 2 and 1 in arr.shape:
+            arr = torch.squeeze(arr)
+        
+        # Handle remaining cases
+        if len(arr.shape) == 2:
+            return arr
+        elif len(arr.shape) == 3:
+            # Take middle slice of first dimension
+            mid_idx = arr.shape[0] // 2
+            return arr[mid_idx]
+        elif len(arr.shape) == 4:
+            # Take middle slice of both first dimensions  
+            mid_idx1 = arr.shape[0] // 2
+            mid_idx2 = arr.shape[1] // 2
+            return arr[mid_idx1, mid_idx2]
+        else:
+            # For higher dimensions, keep taking middle slices
+            while len(arr.shape) > 2:
+                mid_idx = arr.shape[0] // 2
+                arr = arr[mid_idx]
+            return arr
     
     for step in tqdm(range(num_steps), desc="Metrics"):
         pred = predictions[step]  # (F, C, D, H, W)
@@ -270,17 +332,15 @@ def calculate_metrics_per_timestep(predictions: torch.Tensor, ground_truths: tor
             mse_field = F.mse_loss(pred_field, true_field, reduction='mean').item()
             field_mse.append(mse_field)
             
-            # SSIM for this field (use first component if multiple)
-            pred_slice = pred_field[0] if len(pred_field.shape) > 2 else pred_field
-            true_slice = true_field[0] if len(true_field.shape) > 2 else true_field
+            # SSIM for this field - extract 2D slices
+            try:
+                pred_slice = extract_2d_for_ssim(pred_field)
+                true_slice = extract_2d_for_ssim(true_field)
+                ssim_field = calculate_ssim_safe(pred_slice, true_slice)
+            except Exception as e:
+                print(f"Warning: SSIM calculation failed for field {field_idx}, step {step}: {e}")
+                ssim_field = float('nan')
             
-            # For 3D data, take middle slice
-            if len(pred_slice.shape) == 3:
-                mid_idx = pred_slice.shape[0] // 2
-                pred_slice = pred_slice[mid_idx]
-                true_slice = true_slice[mid_idx]
-            
-            ssim_field = calculate_ssim_safe(pred_slice, true_slice)
             field_ssim.append(ssim_field)
         
         metrics['mse_per_field'].append(field_mse)
@@ -311,22 +371,43 @@ def create_visualization_frames(predictions: torch.Tensor, ground_truths: torch.
             pred_field = pred[field_idx]  # (C, D, H, W)
             true_field = true[field_idx]
             
-            # Extract 2D slice for visualization
-            if len(pred_field.shape) == 3:  # (C, D, H, W) - take first component
-                pred_slice = pred_field[0]
-                true_slice = true_field[0]
+            # Extract 2D slice for visualization - handle all dimension cases
+            def extract_2d_slice(tensor):
+                """Extract a 2D slice from tensor of various dimensions."""
+                # Convert to numpy and squeeze out singleton dimensions
+                arr = tensor.detach().cpu().numpy()
                 
-                # For 3D data, take middle slice along depth
-                if len(pred_slice.shape) == 3:
-                    mid_idx = pred_slice.shape[0] // 2
-                    pred_slice = pred_slice[mid_idx].numpy()
-                    true_slice = true_slice[mid_idx].numpy()
+                # Remove singleton dimensions
+                while len(arr.shape) > 2 and 1 in arr.shape:
+                    arr = np.squeeze(arr)
+                
+                # Handle remaining cases
+                if len(arr.shape) == 2:
+                    return arr
+                elif len(arr.shape) == 3:
+                    # Take middle slice of first dimension
+                    mid_idx = arr.shape[0] // 2
+                    return arr[mid_idx]
+                elif len(arr.shape) == 4:
+                    # Take middle slice of both first dimensions
+                    mid_idx1 = arr.shape[0] // 2
+                    mid_idx2 = arr.shape[1] // 2
+                    return arr[mid_idx1, mid_idx2]
                 else:
-                    pred_slice = pred_slice.numpy()
-                    true_slice = true_slice.numpy()
-            else:
-                pred_slice = pred_field.numpy()
-                true_slice = true_field.numpy()
+                    # For higher dimensions, keep taking middle slices
+                    while len(arr.shape) > 2:
+                        mid_idx = arr.shape[0] // 2
+                        arr = arr[mid_idx]
+                    return arr
+            
+            pred_slice = extract_2d_slice(pred_field)
+            true_slice = extract_2d_slice(true_field)
+            
+            # Ensure we have 2D arrays
+            if len(pred_slice.shape) != 2 or len(true_slice.shape) != 2:
+                print(f"Warning: Could not extract 2D slice for field {field_idx}, step {step}")
+                print(f"Pred shape: {pred_slice.shape}, True shape: {true_slice.shape}")
+                continue
             
             # Create comparison frame
             colormap = ['viridis', 'plasma', 'inferno'][field_idx % 3]
