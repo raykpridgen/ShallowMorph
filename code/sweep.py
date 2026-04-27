@@ -421,6 +421,24 @@ def _apply_fm_weights(ft_model: nn.Module, fm_state: dict) -> None:
     # Always strip ``module.`` when loading into unwrapped ``target``. FM checkpoints are
     # often saved from DataParallel; keys must match ``target``, not ``DataParallel``.
     sd = _strip_module_prefix(sd)
+    # When changing architecture knobs (e.g., ar_context/max_ar), some tensors such as
+    # positional embeddings can differ in shape between FM and finetune model. Drop those
+    # incompatible keys and keep loading all compatible FM weights.
+    tgt_sd = target.state_dict()
+    dropped_shape = []
+    for k in list(sd.keys()):
+        if k not in tgt_sd:
+            continue
+        if torch.is_tensor(sd[k]) and torch.is_tensor(tgt_sd[k]) and sd[k].shape != tgt_sd[k].shape:
+            dropped_shape.append((k, tuple(sd[k].shape), tuple(tgt_sd[k].shape)))
+            sd.pop(k)
+    if dropped_shape:
+        msg = ", ".join([f"{k}: {src}->{dst}" for k, src, dst in dropped_shape[:6]])
+        print(
+            "→ Skipping FM keys with shape mismatch (expected when context/model dims differ):",
+            msg,
+            "..." if len(dropped_shape) > 6 else "",
+        )
     inc = target.load_state_dict(sd, strict=False)
     miss_lora = [k for k in inc.missing_keys if _expected_fm_missing_key(k)]
     if miss_lora:
